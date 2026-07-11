@@ -40,6 +40,7 @@ export interface User {
   Permissions?: string; // JSON string — { pages: {...}, <pageKey>: {...granular} }
   Phone?: string;
   Display_Name?: string;
+  Force_Change?: string; // 'YES' | 'NO' — must change password at next login
 }
 
 export interface Role {
@@ -165,6 +166,7 @@ export interface Invoice {
   Total_Value: string;
   Created_On?: string;
   Invoice_File_URL?: string;
+  Status?: string;
 }
 
 // 1. INVENTORY ENTRIES

@@ -10,7 +10,7 @@ import { cn } from '@/lib/utils';
 
 export default function LoginPage() {
   const { login } = useAuth();
-  const [email, setEmail]       = useState('admin@sicca.com');
+  const [email, setEmail]       = useState('');
   const [password, setPassword] = useState('');
   const [showPass, setShowPass] = useState(false);
   const [loading, setLoading]   = useState(false);
@@ -118,17 +118,6 @@ export default function LoginPage() {
               ) : 'Sign In'}
             </Button>
           </form>
-
-          <div className="bg-muted/50 rounded-xl p-4 border border-border/50">
-            <p className="text-xs font-semibold text-muted-foreground mb-2">Demo Credentials</p>
-            <div className="space-y-1 text-xs text-muted-foreground font-mono">
-              <p>Email: <span className="text-foreground">admin@sicca.com</span></p>
-              <p>Password: <span className="text-foreground">Admin@1234</span></p>
-            </div>
-            <p className="text-[10px] text-muted-foreground mt-2 italic">
-              Works even without Google Sheets connected.
-            </p>
-          </div>
         </div>
       </div>
     </div>

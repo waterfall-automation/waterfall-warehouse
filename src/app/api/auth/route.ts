@@ -1,8 +1,13 @@
 export const runtime = 'nodejs';
 
 import { NextRequest, NextResponse } from 'next/server';
+import { readFileSync, existsSync } from 'fs';
+import { join } from 'path';
+import { tmpdir } from 'os';
+import { createHash } from 'crypto';
 
 const APPS_URL = process.env.NEXT_PUBLIC_SHEETS_API_URL || '';
+const DATA_FILE = process.env.DATA_FILE_PATH || join(tmpdir(), 'siccasync-data.json');
 
 const DEMO_USER = {
   id: 'USR-001', name: 'Admin User', email: 'admin@sicca.com',
@@ -11,6 +16,25 @@ const DEMO_USER = {
 
 function isRealAppsScript() {
   return APPS_URL && !APPS_URL.includes('YOUR_DEPLOYMENT_ID');
+}
+
+function loadLocalUsers(): any[] {
+  try {
+    if (existsSync(DATA_FILE)) {
+      const raw = readFileSync(DATA_FILE, 'utf-8');
+      if (raw?.trim()) {
+        const store = JSON.parse(raw);
+        return store.users || [];
+      }
+    }
+  } catch (e) {
+    console.error('Failed to load local users:', e);
+  }
+  return [];
+}
+
+function hashPassword(password: string): string {
+  return createHash('sha256').update(password).digest('hex');
 }
 
 async function proxyGet(params: Record<string, string>) {
@@ -61,10 +85,46 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // Fallback
+  // Fallback (when Apps Script is NOT configured)
   if (action === 'login') {
+    const users = loadLocalUsers();
+    const user = users.find((u: any) => (u.Email || '').toLowerCase() === email);
+    if (user) {
+      const hashed = hashPassword(pass);
+      if (user.Password_Hash === hashed) {
+        return NextResponse.json({
+          success: true,
+          token: `local-token-${user.User_ID}`,
+          user: {
+            id: user.User_ID,
+            name: user.Display_Name || user.Full_Name,
+            email: user.Email,
+            role: user.Role,
+            department: user.Department,
+            forceChange: user.Force_Change === 'YES',
+          }
+        });
+      } else {
+        return NextResponse.json({ success: false, error: 'Incorrect password.' });
+      }
+    }
     return NextResponse.json({ success: false, error: 'Invalid credentials. Use admin@sicca.com / Admin@1234' });
   }
+
+  if (action === 'validateToken') {
+    const token = searchParams.get('token') || '';
+    if (token === 'demo-admin-token') {
+      return NextResponse.json({ valid: true });
+    }
+    if (token.startsWith('local-token-')) {
+      const userId = token.replace('local-token-', '');
+      const users = loadLocalUsers();
+      const userExists = users.some((u: any) => u.User_ID === userId);
+      return NextResponse.json({ valid: userExists });
+    }
+    return NextResponse.json({ valid: false });
+  }
+
   return NextResponse.json({ success: true });
 }
 

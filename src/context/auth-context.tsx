@@ -3,7 +3,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useUsers } from '@/hooks/use-inventory-data';
-import { parsePermissions, allPagesGranted, canAccessPage as canAccessPageImpl, pathToPageKey, PermData } from '@/lib/permissions';
+import { parsePermissions, allPagesGranted, canAccessPage as canAccessPageImpl, pathToPageKey, PermData, isBroadAccessRole } from '@/lib/permissions';
 
 export type AppUser = {
   id: string; name: string; email: string; role: string;
@@ -35,29 +35,14 @@ const AuthContext = createContext<AuthCtx>({
   setDevViewAs: () => {},
 });
 
-const MOCK_ADMIN: AppUser = {
-  id: 'USR001',
-  name: 'Admin',
-  email: 'admin@sicca.com',
-  role: 'Super Admin',
-  department: 'Admin',
-  permissions: { pages: allPagesGranted(), granular: {}, notifications: {} },
-};
-
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const { users } = useUsers();
   const [devViewAsUserId, setDevViewAsUserIdState] = useState<string | null>(null);
-  const [token, setToken] = useState<string | null>('mock_token');
-  const [loading, setLoading] = useState(false);
+  const [token, setToken] = useState<string | null>(null);
+  const [loggedInUser, setLoggedInUser] = useState<any | null>(null);
+  const [loading, setLoading] = useState(true);
   const router   = useRouter();
   const pathname = usePathname();
-
-  useEffect(() => {
-    // Dev-only override; never honor the stored value in a production build.
-    if (process.env.NODE_ENV === 'production') return;
-    const stored = localStorage.getItem('sicca_dev_view_as');
-    if (stored) setDevViewAsUserIdState(stored);
-  }, []);
 
   const setDevViewAs = useCallback((userId: string | null) => {
     setDevViewAsUserIdState(userId);
@@ -65,55 +50,161 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     else localStorage.removeItem('sicca_dev_view_as');
   }, []);
 
-  const user: AppUser = useMemo(() => {
-    if (devViewAsUserId) {
+  const performLogout = useCallback(async () => {
+    const currentToken = localStorage.getItem('sicca_token') || token;
+    localStorage.removeItem('sicca_token');
+    localStorage.removeItem('sicca_user');
+    localStorage.removeItem('sicca_dev_view_as');
+    setToken(null);
+    setLoggedInUser(null);
+    setDevViewAsUserIdState(null);
+    
+    router.replace('/login');
+
+    if (currentToken) {
+      try {
+        await fetch('/api/auth', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'logout', token: currentToken }),
+        });
+      } catch (err) {
+        console.error('Failed to notify backend of logout:', err);
+      }
+    }
+  }, [token, router]);
+
+  const logout = performLogout;
+
+  useEffect(() => {
+    // Restore dev-only override
+    if (process.env.NODE_ENV !== 'production') {
+      const storedDev = localStorage.getItem('sicca_dev_view_as');
+      if (storedDev) setDevViewAsUserIdState(storedDev);
+    }
+
+    // Restore real session
+    const storedToken = localStorage.getItem('sicca_token');
+    const storedUser = localStorage.getItem('sicca_user');
+    if (storedToken && storedUser) {
+      setToken(storedToken);
+      try {
+        const u = JSON.parse(storedUser);
+        setLoggedInUser(u);
+
+        // Background validate token against the backend
+        fetch(`/api/auth?action=validateToken&token=${encodeURIComponent(storedToken)}`)
+          .then(res => res.json())
+          .then(data => {
+            if (data && data.valid === false) {
+              console.warn("Session expired or invalid, logging out...");
+              performLogout();
+            }
+          })
+          .catch(err => {
+            console.error("Background token validation failed:", err);
+          });
+      } catch {
+        setLoggedInUser(null);
+        setToken(null);
+      }
+    }
+    setLoading(false);
+  }, [performLogout]);
+
+  const user = useMemo<AppUser | null>(() => {
+    // If dev-only override is set, use that user if found
+    if (process.env.NODE_ENV !== 'production' && devViewAsUserId) {
       const u = users.find((x: any) => x.User_ID === devViewAsUserId);
       if (u) {
         return {
-          id: u.User_ID, name: u.Full_Name, email: u.Email, role: u.Role,
-          department: u.Department, permissions: parsePermissions(u.Permissions),
+          id: u.User_ID,
+          name: u.Full_Name,
+          email: u.Email,
+          role: u.Role,
+          department: u.Department,
+          permissions: parsePermissions(u.Permissions),
+          forceChange: u.Force_Change === 'YES',
         };
       }
     }
-    return MOCK_ADMIN;
-  }, [devViewAsUserId, users]);
 
-  // Redirect to dashboard if trying to access login
-  useEffect(() => {
-    if (pathname === '/login') {
-      router.replace('/dashboard');
+    if (!loggedInUser) return null;
+
+    // Find the logged-in user in the loaded users sheet data to resolve permissions dynamically
+    const u = users.find((x: any) => x.User_ID === loggedInUser.id || (x.Email && x.Email.toLowerCase() === loggedInUser.email.toLowerCase()));
+    if (u) {
+      return {
+        id: u.User_ID,
+        name: u.Full_Name,
+        email: u.Email,
+        role: u.Role,
+        department: u.Department,
+        permissions: parsePermissions(u.Permissions),
+        forceChange: u.Force_Change === 'YES',
+      };
     }
-  }, [pathname, router]);
 
-  // Shared route guard: redirects away from any page the current (mock or
-  // dev-view-as) user isn't permitted to see. Lives here, once, rather than
-  // copy-pasted into every page component. Depends on the resolved boolean,
-  // not the whole `user` object, so it doesn't re-fire on every re-render
-  // just because `users` got a new array reference from polling.
-  const pageKeyHere = pathToPageKey(pathname);
-  const allowedHere = pageKeyHere ? canAccessPageImpl(user.role, user.permissions, pageKeyHere) : true;
+    // Fallback if the user is not in users list (or users list is loading)
+    return {
+      id: loggedInUser.id,
+      name: loggedInUser.name,
+      email: loggedInUser.email,
+      role: loggedInUser.role,
+      department: loggedInUser.department,
+      forceChange: loggedInUser.forceChange,
+      permissions: isBroadAccessRole(loggedInUser.role)
+        ? { pages: allPagesGranted(), granular: {}, notifications: {} }
+        : { pages: {}, granular: {}, notifications: {} }
+    };
+  }, [devViewAsUserId, loggedInUser, users]);
+
+  // Route guarding
   useEffect(() => {
+    if (loading) return;
+
+    if (!token) {
+      if (pathname !== '/login') {
+        router.replace('/login');
+      }
+    } else {
+      if (pathname === '/login') {
+        router.replace('/dashboard');
+      }
+    }
+  }, [token, pathname, router, loading]);
+
+  const pageKeyHere = pathname ? pathToPageKey(pathname) : null;
+  const allowedHere = (user && pageKeyHere) ? canAccessPageImpl(user.role, user.permissions, pageKeyHere) : true;
+
+  useEffect(() => {
+    if (loading || !token) return;
     if (pageKeyHere && !allowedHere) {
       router.replace('/dashboard');
     }
-  }, [pageKeyHere, allowedHere, router]);
-
-  useEffect(() => {
-    if (user) {
-      localStorage.setItem('sicca_current_user', JSON.stringify(user));
-    }
-  }, [user]);
+  }, [pageKeyHere, allowedHere, router, loading, token]);
 
   const login = useCallback(async (email: string, password: string) => {
-    return { success: true };
-  }, []);
-
-  const logout = useCallback(async () => {
-    // No-op or keep at dashboard
-    router.replace('/dashboard');
+    try {
+      const res = await fetch(`/api/auth?action=login&email=${encodeURIComponent(email)}&password=${encodeURIComponent(password)}`);
+      const data = await res.json();
+      if (data && data.success) {
+        localStorage.setItem('sicca_token', data.token);
+        localStorage.setItem('sicca_user', JSON.stringify(data.user));
+        setToken(data.token);
+        setLoggedInUser(data.user);
+        router.replace('/dashboard');
+        return { success: true };
+      } else {
+        return { success: false, error: data?.error || 'Login failed.' };
+      }
+    } catch (err: any) {
+      return { success: false, error: err?.message || 'Network error during login.' };
+    }
   }, [router]);
 
   const canAccessPage = useCallback((pageKey: string) => {
+    if (!user) return false;
     return canAccessPageImpl(user.role, user.permissions, pageKey);
   }, [user]);
 
