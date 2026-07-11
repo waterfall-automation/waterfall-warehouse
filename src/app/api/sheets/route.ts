@@ -1,4 +1,7 @@
 export const runtime = 'nodejs';
+// Apps Script round-trips regularly take 5-15s; Vercel's default limit killed
+// them mid-flight, so the client fell back to demo data.
+export const maxDuration = 30;
 
 /**
  * /api/sheets  (FIXED v3)
@@ -25,9 +28,6 @@ import { tmpdir } from 'os';
 
 const APPS_URL   = process.env.NEXT_PUBLIC_SHEETS_API_URL || '';
 const DATA_FILE  = process.env.DATA_FILE_PATH  || join(tmpdir(), 'siccasync-data.json');
-
-// Track whether we've already run initialSetup this process lifetime
-let _setupDone = false;
 
 function isRealAppsScript() {
   return !!APPS_URL && !APPS_URL.includes('YOUR_DEPLOYMENT_ID');
@@ -156,7 +156,7 @@ function localGet(action: string, params: URLSearchParams): any {
       return { success:true, summary:{totalTaxable:totT,totalCGST:totC,totalSGST:totS,totalGST:totC+totS,totalInvoice:totI}, byRate:Object.values(byRate), entries:inward };
     }
     case 'getNotices': return { success:true, notices:[...store.notices].reverse() };
-    case 'getTasks': return { success:true, tasks:[...(store.tasks || [])].reverse() };
+    case 'getTasks': return { success:true, tasks:[...(store.tasks || [])].filter((t: any) => t.Status !== 'Deleted').reverse() };
     case 'getActivityLog': return { success:true, logs:[...store.activityLog].reverse().slice(0,200) };
     case 'getRecycleBin': return { success:true, items:[...store.recycleBin].reverse() };
     case 'getSettings': return { success:true, settings:{appName:'SiccaSync',orgName:'Sicca Automation India Pvt. Ltd.',...store.settings} };
@@ -590,25 +590,11 @@ function localPost(action: string, body: any): any {
 // Apps Script proxy helpers
 // ─────────────────────────────────────────────────────────────
 
-async function appsScriptInit(): Promise<void> {
-  if (_setupDone) return;
-  try {
-    const url = new URL(APPS_URL);
-    url.searchParams.set('action', 'initialSetup');
-    const res = await fetch(url.toString(), { cache:'no-store', redirect:'follow', signal: AbortSignal.timeout(20000) });
-    const text = await res.text();
-    const data = JSON.parse(text);
-    if (data?.success) _setupDone = true;
-  } catch (err) {
-    // Non-fatal — Apps Script may still work even if init call fails
-    console.warn('SiccaSync: initialSetup call failed (will retry):', err);
-  }
-}
+// NOTE: no init pre-call — Apps Script self-heals sheets on every request,
+// and the extra round-trip pushed cold serverless invocations past Vercel's
+// function time limit, which is what caused the demo-data fallback in prod.
 
 async function proxyGet(params: Record<string, string>) {
-  // Ensure sheets exist on first use
-  if (!_setupDone) await appsScriptInit();
-
   const url = new URL(APPS_URL);
   Object.entries(params).forEach(([k,v]) => url.searchParams.set(k,v));
   const res = await fetch(url.toString(), { cache:'no-store', redirect:'follow', signal: AbortSignal.timeout(20000) });
@@ -618,8 +604,6 @@ async function proxyGet(params: Record<string, string>) {
 }
 
 async function proxyPost(body: object) {
-  if (!_setupDone) await appsScriptInit();
-
   const res = await fetch(APPS_URL, {
     method:'POST',
     headers:{'Content-Type':'application/json'},

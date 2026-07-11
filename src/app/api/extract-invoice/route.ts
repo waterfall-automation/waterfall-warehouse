@@ -1,5 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 
+export const maxDuration = 60; // Gemini vision extraction on large invoices is slow
+
 export async function POST(req: NextRequest) {
   let body: any = {};
   try {

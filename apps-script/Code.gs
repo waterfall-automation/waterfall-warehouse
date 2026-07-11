@@ -205,11 +205,10 @@ function doGet(e) {
     return jsonResponse({ success: false, error: 'Cannot open spreadsheet: ' + err.toString() + '. Check SS_ID in Code.gs.' });
   }
 
-  // Always ensure all sheets exist — this is the self-healing mechanism
-  try { ensureSheets(ss); } catch (e2) { /* non-fatal */ }
-
-  // On very first call (or explicit initialSetup), also seed default data
-  try { seedDefaultData(ss); } catch (e3) { /* non-fatal */ }
+  // Ensure sheets exist + seed defaults, but only once — running this on
+  // every call added ~5s+ latency per request and pushed Vercel functions
+  // past their time limit. Explicit ?action=initialSetup still force-heals.
+  try { ensureSetupOnce(ss); } catch (e2) { /* non-fatal */ }
 
   try {
     switch (action) {
@@ -299,8 +298,7 @@ function doPost(e) {
     return jsonResponse({ success: false, error: 'Cannot open spreadsheet: ' + err.toString() });
   }
 
-  try { ensureSheets(ss); } catch (e2) {}
-  try { seedDefaultData(ss); } catch (e3) {}
+  try { ensureSetupOnce(ss); } catch (e2) {}
 
   var action = (body.action || '').trim();
 
@@ -411,6 +409,17 @@ function doPost(e) {
 
 // ── seedDefaultData — runs silently, only inserts if empty ────
 // Called automatically on every request — safe because it checks first
+
+// Run ensureSheets + seedDefaultData once per script lifetime (property-
+// guarded). Delete the SETUP_OK script property (or call initialSetup) to
+// force a re-heal after manually deleting tabs.
+function ensureSetupOnce(ss) {
+  var props = PropertiesService.getScriptProperties();
+  if (props.getProperty('SETUP_OK')) return;
+  ensureSheets(ss);
+  seedDefaultData(ss);
+  props.setProperty('SETUP_OK', 'yes');
+}
 
 function seedDefaultData(ss) {
   // Seed Super Admin role

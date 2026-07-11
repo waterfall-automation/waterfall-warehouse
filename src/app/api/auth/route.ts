@@ -1,4 +1,5 @@
 export const runtime = 'nodejs';
+export const maxDuration = 30; // Apps Script login round-trip can exceed Vercel's default limit
 
 import { NextRequest, NextResponse } from 'next/server';
 import { readFileSync, existsSync } from 'fs';
