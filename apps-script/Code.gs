@@ -219,6 +219,9 @@ function doGet(e) {
       case 'initialSetup':
         result = initialSetup(ss);
         break;
+      case 'freshLaunchWipe':
+        result = handleFreshLaunchWipe(e.parameter.confirm, ss);
+        break;
       case 'login':
         result = handleLogin(e.parameter.email, e.parameter.password, ss);
         break;
