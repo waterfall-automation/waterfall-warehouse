@@ -1,0 +1,28 @@
+{
+  "placeholderImages": [
+    {
+      "id": "cupboard-1",
+      "description": "Main Warehouse Storage Unit",
+      "imageUrl": "https://picsum.photos/seed/cup1/600/400",
+      "imageHint": "warehouse storage"
+    },
+    {
+      "id": "cupboard-2",
+      "description": "Chemical Safety Cabinet",
+      "imageUrl": "https://picsum.photos/seed/cup2/600/400",
+      "imageHint": "safety cabinet"
+    },
+    {
+      "id": "item-1",
+      "description": "Precision Multimeter",
+      "imageUrl": "https://picsum.photos/seed/item1/400/300",
+      "imageHint": "electronic tool"
+    },
+    {
+      "id": "item-2",
+      "description": "Industrial Safety Gloves",
+      "imageUrl": "https://picsum.photos/seed/item2/400/300",
+      "imageHint": "safety gloves"
+    }
+  ]
+}

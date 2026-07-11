@@ -1,0 +1,106 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 210 20% 96%;
+    --foreground: 222 47% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 47% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 47% 11%;
+    --primary: 218 60% 26%;
+    --primary-foreground: 210 40% 98%;
+    --secondary: 218 40% 40%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 210 40% 90%;
+    --muted-foreground: 215 16% 47%;
+    --accent: 218 40% 40%;
+    --accent-foreground: 222 47% 11%;
+    --destructive: 0 84.2% 60.2%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 214 32% 91%;
+    --input: 214 32% 91%;
+    --ring: 218 60% 26%;
+    --radius: 0.6rem;
+    --sidebar-background: 218 60% 26%;
+    --sidebar-foreground: 210 40% 98%;
+    --sidebar-primary: 210 40% 98%;
+    --sidebar-primary-foreground: 218 60% 26%;
+    --sidebar-accent: 218 50% 32%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 218 50% 32%;
+    --sidebar-ring: 210 40% 98%;
+  }
+
+  .dark {
+    --background: 222 47% 11%;
+    --foreground: 210 40% 98%;
+    --card: 222 47% 11%;
+    --card-foreground: 210 40% 98%;
+    --popover: 222 47% 11%;
+    --popover-foreground: 210 40% 98%;
+    --primary: 210 40% 98%;
+    --primary-foreground: 222 47% 11%;
+    --secondary: 217 32% 17%;
+    --secondary-foreground: 210 40% 98%;
+    --muted: 217 32% 17%;
+    --muted-foreground: 215 20% 65%;
+    --accent: 217 32% 17%;
+    --accent-foreground: 210 40% 98%;
+    --destructive: 0 62.8% 30.6%;
+    --destructive-foreground: 210 40% 98%;
+    --border: 217 32% 17%;
+    --input: 217 32% 17%;
+    --ring: 212 26% 83%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+}
+
+/* Design Mode Inspector Styles */
+.design-mode-active *:not(.design-overlay-ignore) {
+  outline: 1px dotted rgba(0, 0, 0, 0.2);
+  transition: outline 0.2s ease;
+}
+
+.design-mode-active *:hover:not(.design-overlay-ignore) {
+  outline: 2px dotted hsl(var(--primary));
+  cursor: crosshair;
+}
+
+.design-mode-active .element-selected {
+  outline: 2px solid hsl(var(--primary)) !important;
+  background-color: hsla(var(--primary), 0.05) !important;
+}
+
+/* Custom shelf styles */
+.shelf-gradient {
+  background: linear-gradient(180deg, rgba(0,0,0,0.05) 0%, rgba(0,0,0,0) 20%, rgba(0,0,0,0.1) 100%);
+}
+
+.scrollbar-hide::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-hide {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+/* Universal click feedback — a brief blue flash confirming a click was registered. */
+.click-flash {
+  animation: click-flash-fade 2.5s ease-out;
+  border-radius: inherit;
+}
+@keyframes click-flash-fade {
+  0%, 8% { background-color: rgba(37, 99, 235, 0.25); }
+  100% { background-color: rgba(37, 99, 235, 0); }
+}
