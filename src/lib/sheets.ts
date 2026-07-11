@@ -55,13 +55,35 @@ export const ALL_PERMISSIONS = [
   { key:'perm_dev_tools',        label:'Developer Tools',      group:'Advanced' },
 ] as const;
 
-export async function fetchSheetTab(sheetType: string, tabName: string): Promise<any[]> {
+// ── Request governor ─────────────────────────────────────────────────────
+// Every polling hook funnels reads through fetchSheetTab, and each call hits
+// Apps Script directly from the browser. 10 hooks × ~30s polls × open tabs
+// blew past Google's ~30-simultaneous-executions cap ("Too many simultaneous
+// invocations"). Governor: short TTL cache + in-flight dedupe + concurrency
+// cap + serve-from-cache while the browser tab is hidden.
+const CACHE_TTL_MS = 15_000;
+const MAX_CONCURRENT = 4;
+const tabCache = new Map<string, { at: number; data: any[] }>();
+const inflight = new Map<string, Promise<any[]>>();
+let activeFetches = 0;
+const fetchQueue: (() => void)[] = [];
+
+async function withSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (activeFetches >= MAX_CONCURRENT) {
+    await new Promise<void>(resolve => fetchQueue.push(resolve));
+  }
+  activeFetches++;
+  try { return await fn(); }
+  finally { activeFetches--; fetchQueue.shift()?.(); }
+}
+
+async function rawFetchSheetTab(sheetType: string, tabName: string): Promise<any[]> {
   const urlStr = process.env.NEXT_PUBLIC_SHEETS_API_URL;
   if (!urlStr) throw new Error('NEXT_PUBLIC_SHEETS_API_URL not configured');
   const url = new URL(urlStr);
   url.searchParams.set('sheet', sheetType);
   url.searchParams.set('tab', tabName);
-  
+
   const res = await fetch(url.toString(), { cache: 'no-store' });
   if (!res.ok) {
     throw new Error(`HTTP error ${res.status}`);
@@ -71,6 +93,23 @@ export async function fetchSheetTab(sheetType: string, tabName: string): Promise
     throw new Error(json?.error || 'Failed to fetch sheet data');
   }
   return json.data || [];
+}
+
+export async function fetchSheetTab(sheetType: string, tabName: string): Promise<any[]> {
+  const key = `${sheetType}:${tabName}`;
+  const hit = tabCache.get(key);
+  const hidden = typeof document !== 'undefined' && document.hidden;
+  // Fresh cache, or any cache at all while the tab is hidden → no network.
+  if (hit && (Date.now() - hit.at < CACHE_TTL_MS || hidden)) return hit.data;
+
+  const existing = inflight.get(key);
+  if (existing) return existing;
+
+  const p = withSlot(() => rawFetchSheetTab(sheetType, tabName))
+    .then(data => { tabCache.set(key, { at: Date.now(), data }); return data; })
+    .finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
 }
 
 export async function postSheetRow(tabName: string, rowData: Record<string, any>): Promise<any> {
@@ -93,5 +132,7 @@ export async function postSheetRow(tabName: string, rowData: Record<string, any>
   if (!json || json.success === false) {
     throw new Error(json?.error || 'Failed to post row data');
   }
+  // A write makes the cached copy of this tab stale — next read goes to network.
+  tabCache.delete(`database:${tabName}`);
   return json;
 }
