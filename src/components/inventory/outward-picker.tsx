@@ -1,14 +1,15 @@
 "use client";
 
-import React, { useMemo, useState } from 'react';
+import React, { useMemo, useState, useEffect } from 'react';
 import { Input } from '@/components/ui/input';
 import { Button } from '@/components/ui/button';
 import { ArrowLeft, ArrowUpFromLine, Minus, Plus, Search, Trash2, X } from 'lucide-react';
 import {
-  useItemMaster, useBoxesAndPlacements, useCupboards, useInventoryEntries,
+  useItemMaster, useBoxesAndPlacements, useCupboards, useInventoryEntries, useEmployees,
 } from '@/hooks/use-inventory-data';
 import { useToast } from '@/hooks/use-toast';
 import { cn, safeStr } from '@/lib/utils';
+import { useAuth } from '@/context/auth-context';
 
 type CartLine = {
   placementId: string;
@@ -58,16 +59,68 @@ function QtyStepper({ value, max, onChange }: { value: number; max: number; onCh
   );
 }
 
+// ── Generic autocomplete for simple text inputs ──
+function AutocompleteInput({
+  value, onChangeText, options, getLabel, onSelect, onCreateNew, placeholder, newLabelPrefix
+}: {
+  value: string;
+  onChangeText: (v: string) => void;
+  options: any[];
+  getLabel: (o: any) => string;
+  onSelect: (o: any) => void;
+  onCreateNew?: (name: string) => void;
+  placeholder: string;
+  newLabelPrefix: string;
+}) {
+  const [open, setOpen] = useState(false);
+  const q = value.trim().toLowerCase();
+  const label = (o: any) => String(getLabel(o) || '');
+  const matches = q ? options.filter(o => label(o).toLowerCase().includes(q)).slice(0, 6) : [];
+  const exact = q ? options.some(o => label(o).toLowerCase() === q) : true;
+
+  return (
+    <div className="relative">
+      <Input
+        value={value}
+        onChange={e => { onChangeText(e.target.value); setOpen(true); }}
+        onFocus={() => setOpen(true)}
+        onBlur={() => setTimeout(() => setOpen(false), 150)}
+        placeholder={placeholder}
+        className="h-9 text-sm bg-white"
+        autoComplete="off"
+      />
+      {open && q && (
+        <div className="absolute left-0 right-0 mt-1 bg-white border border-gray-200 rounded-md shadow-lg z-50 overflow-hidden divide-y divide-gray-100 text-sm max-h-56 overflow-y-auto">
+          {!exact && onCreateNew && (
+            <button type="button" onMouseDown={e => e.preventDefault()} onClick={() => { onCreateNew(value.trim()); setOpen(false); }}
+              className="w-full text-left px-3 py-2 hover:bg-blue-50 text-blue-700 font-medium flex items-center gap-1">
+              <Plus className="h-3 w-3" /> {newLabelPrefix} &ldquo;{value.trim()}&rdquo;
+            </button>
+          )}
+          {matches.map((o, i) => (
+            <button key={i} type="button" onMouseDown={e => e.preventDefault()} onClick={() => { onSelect(o); setOpen(false); }}
+              className="w-full text-left px-3 py-2 hover:bg-gray-50 text-gray-800">
+              {getLabel(o)}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function OutwardPicker({ onClose }: { onClose: () => void }) {
+  const { user } = useAuth();
   const { items: catalogItems } = useItemMaster();
   const { placements, boxes, reducePlacementQty } = useBoxesAndPlacements();
   const { cupboards } = useCupboards();
   const { addEntry } = useInventoryEntries();
+  const { employees } = useEmployees();
   const { toast } = useToast();
 
   // Common fields — asked once for the whole transaction.
   const [entryDate, setEntryDate] = useState(todayISO());
-  const [employeeName, setEmployeeName] = useState('');
+  const [employeeName, setEmployeeName] = useState(user?.name || '');
   const [issuedTo, setIssuedTo] = useState('');
   const [remarks, setRemarks] = useState('');
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -76,6 +129,12 @@ export function OutwardPicker({ onClose }: { onClose: () => void }) {
   const [pickedItemCode, setPickedItemCode] = useState<string | null>(null);
   const [cart, setCart] = useState<CartLine[]>([]);
   const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (user?.name && !employeeName) {
+      setEmployeeName(user.name);
+    }
+  }, [user, employeeName]);
 
   const locationLabelFor = (cupboardId: string, boxId: string) => {
     const cup = cupboards.find(c => c.Cupboard_ID === cupboardId);
@@ -208,10 +267,19 @@ export function OutwardPicker({ onClose }: { onClose: () => void }) {
             <label className="text-xs font-semibold text-gray-700">Date</label>
             <Input type="date" value={entryDate} onChange={e => setEntryDate(e.target.value)} className="h-9 mt-1" />
           </div>
-          <div>
+          <div className="relative">
             <label className="text-xs font-semibold text-gray-700">Handled By (Employee)</label>
-            <Input value={employeeName} onChange={e => setEmployeeName(e.target.value)}
-              placeholder="Employee name" className="h-9 mt-1" />
+            <div className="mt-1">
+              <AutocompleteInput
+                value={employeeName}
+                onChangeText={setEmployeeName}
+                options={employees}
+                getLabel={o => o.Full_Name}
+                placeholder="Employee name"
+                newLabelPrefix="Use"
+                onSelect={o => setEmployeeName(o.Full_Name)}
+              />
+            </div>
           </div>
           <div>
             <label className="text-xs font-semibold text-gray-700">Issued To <span className="text-red-500">*</span></label>

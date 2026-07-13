@@ -81,9 +81,9 @@ export default function VendorsPage() {
     setSaving(true);
     try {
       if (editVendor) {
-        updateVendor(editVendor.Vendor_ID, form);
+        await updateVendor(editVendor.Vendor_ID, form);
       } else {
-        addVendor(form);
+        await addVendor(form);
       }
       setShowModal(false);
       setErrors({});

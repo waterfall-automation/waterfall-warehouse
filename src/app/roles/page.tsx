@@ -137,9 +137,9 @@ export default function RolesPage() {
     try {
       const payload = { name, description: desc, permissions: perms };
       if (editRole) {
-        updateRole(editRole.Role_ID, payload);
+        await updateRole(editRole.Role_ID, payload);
       } else {
-        addRole(payload);
+        await addRole(payload);
       }
       setShowModal(false);
       setErrors({});

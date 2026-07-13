@@ -9,13 +9,14 @@ import { Card, CardContent } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
-import { Dialog, DialogContent, DialogHeader, DialogTitle } from '@/components/ui/dialog';
-import { FileText, Search, X, Package, RefreshCw, ArrowDownToLine, ArrowUpFromLine, ExternalLink } from 'lucide-react';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
+import { FileText, Search, X, Package, RefreshCw, ArrowDownToLine, ArrowUpFromLine, ExternalLink, Trash2 } from 'lucide-react';
 import { useInvoices, useInventoryEntries, useItemMaster } from '@/hooks/use-inventory-data';
 import { Button } from '@/components/ui/button';
 import { InfoPopup } from '@/components/shared/info-popup';
 import { flashClick } from '@/lib/click-flash';
 import { cn } from '@/lib/utils';
+import { useAuth } from '@/context/auth-context';
 
 // Entries store Date_Time as "DD-MM-YYYY HH:mm" — parse that for chronological sort,
 // falling back to a direct Date parse for any other format already in the sheet.
@@ -32,9 +33,12 @@ function parseDT(s: string): number {
 export default function InvoicesPage() {
   if (!PAGE_CONFIG.invoices) return <UnderDevelopment pageName="Invoices" />;
 
+  const { user } = useAuth();
+  const isAdmin = user?.role === 'Super Admin' || user?.role === 'Inventory Lead';
+
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { invoices, loading: loadingInvoices } = useInvoices();
+  const { invoices, deleteInvoice, loading: loadingInvoices } = useInvoices();
   const { entries } = useInventoryEntries();
   const { items: catalogItems } = useItemMaster();
 
@@ -47,6 +51,7 @@ export default function InvoicesPage() {
   const [itemPopupCode, setItemPopupCode] = useState<string | null>(null);
   const [selectedVendor, setSelectedVendor] = useState<string | null>(null);
   const [selectedEmployee, setSelectedEmployee] = useState<string | null>(null);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
 
   // Deep-link support: /invoices?invoice=INV-123 auto-opens that invoice's detail panel
   // (used by Vendor Master's "Items Purchased" click-through).
@@ -331,6 +336,17 @@ export default function InvoicesPage() {
                   </button>
                 ))}
               </div>
+              {isAdmin && (
+                <div className="p-4 border-t bg-gray-50 flex justify-end flex-shrink-0">
+                  <Button 
+                    variant="destructive" 
+                    onClick={() => setShowDeleteConfirm(true)}
+                    className="w-full bg-red-600 hover:bg-red-700 text-white flex items-center justify-center gap-1.5 h-9 text-xs font-semibold rounded-lg"
+                  >
+                    <Trash2 className="h-4 w-4" /> Delete Invoice & Associated Entries
+                  </Button>
+                </div>
+              )}
             </>
           )}
         </SheetContent>
@@ -418,6 +434,57 @@ export default function InvoicesPage() {
               </button>
               <img src={previewImageUrl} alt="Invoice Preview" className="max-h-[80vh] max-w-full object-contain rounded" />
             </div>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {showDeleteConfirm && activeInvoice && (
+        <Dialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
+          <DialogContent className="max-w-sm">
+            <DialogHeader>
+              <DialogTitle className="text-red-600 flex items-center gap-2">
+                <Trash2 className="h-5 w-5 text-red-600" /> Delete Invoice?
+              </DialogTitle>
+            </DialogHeader>
+            <div className="py-2 text-sm text-muted-foreground space-y-3">
+              <p>
+                Are you sure you want to delete invoice <strong className="font-mono text-foreground">{activeInvoice.Invoice_No}</strong> from <strong className="text-foreground">{activeInvoice.Vendor_Name}</strong>?
+              </p>
+              {activeRows.length > 0 ? (
+                <div className="bg-red-50 text-red-800 p-3.5 rounded-xl border border-red-100 text-xs">
+                  <p className="font-bold flex items-center gap-1">⚠️ Warning: Affected Stock Entries</p>
+                  <p className="mt-1 leading-relaxed">
+                    This invoice has <strong>{activeRows.length}</strong> associated entry rows in the Stock Register. These will be <strong>permanently deleted</strong> along with the invoice to prevent orphaned records and keep inventory balances accurate.
+                  </p>
+                </div>
+              ) : (
+                <div className="bg-gray-50 text-gray-700 p-3.5 rounded-xl border border-gray-100 text-xs">
+                  <p className="font-semibold">No stock register rows are associated with this invoice.</p>
+                </div>
+              )}
+            </div>
+            <DialogFooter className="mt-4 gap-2 flex flex-col sm:flex-row">
+              <Button 
+                variant="ghost" 
+                onClick={() => setShowDeleteConfirm(false)}
+                className="flex-1 border"
+              >
+                Cancel
+              </Button>
+              <Button 
+                variant="destructive"
+                onClick={async () => {
+                  setShowDeleteConfirm(false);
+                  const res = await deleteInvoice(activeInvoice.Invoice_No);
+                  if (res.success) {
+                    setActiveInvoiceNo(null);
+                  }
+                }}
+                className="flex-1 bg-red-600 hover:bg-red-700 text-white"
+              >
+                Delete Invoice
+              </Button>
+            </DialogFooter>
           </DialogContent>
         </Dialog>
       )}

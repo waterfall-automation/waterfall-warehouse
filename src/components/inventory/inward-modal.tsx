@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Popover, PopoverTrigger, PopoverContent } from '@/components/ui/popover';
@@ -12,6 +12,7 @@ import {
 import { useToast } from '@/hooks/use-toast';
 import { cn } from '@/lib/utils';
 import { Invoice } from '@/lib/demo-data';
+import { useAuth } from '@/context/auth-context';
 
 type LocationAllocation = {
   key: string;
@@ -277,6 +278,7 @@ function LocationPicker({ rowQty, value, onChange }: {
 // rendering with an `open` prop — every hook below polls the backend on mount, so mounting
 // it unconditionally means it's still hammering the API even while "closed".
 export function InwardModal({ onClose }: { onClose: () => void }) {
+  const { user } = useAuth();
   const { items: catalogItems, refresh: refreshCatalog } = useItemMaster();
   const { employees, refresh: refreshEmployees } = useEmployees();
   const { saveInwardBatch, refresh: refreshEntries } = useInventoryEntries();
@@ -291,7 +293,7 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
 
   // Common fields — asked once for the whole submission, not per row.
   const [entryDate, setEntryDate] = useState(todayISO());
-  const [employeeName, setEmployeeName] = useState('');
+  const [employeeName, setEmployeeName] = useState(user?.name || '');
   const [isNewEmployee, setIsNewEmployee] = useState(false);
   const [invoiceNo, setInvoiceNo] = useState('');
   const [vendorName, setVendorName] = useState('');
@@ -307,8 +309,17 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
   const [scannedFile, setScannedFile] = useState<{ base64Data: string; mimeType: string; name: string } | null>(null);
   const [dragActive, setDragActive] = useState(false);
 
+  useEffect(() => {
+    if (user?.name && !employeeName) {
+      setEmployeeName(user.name);
+    }
+  }, [user, employeeName]);
+
   const hasUnsavedChanges = () => {
-    if (employeeName.trim() || invoiceNo.trim() || vendorName.trim() || grnNo.trim()) return true;
+    // If the only change is the default employee name, we shouldn't block closing as "unsaved changes"
+    const currentEmp = employeeName.trim();
+    const defaultEmp = (user?.name || '').trim();
+    if ((currentEmp !== defaultEmp && currentEmp) || invoiceNo.trim() || vendorName.trim() || grnNo.trim()) return true;
     if (rows.length > 1) return true;
     const r0 = rows[0];
     if (r0.itemName.trim() || r0.qty || r0.price || r0.remarks.trim() || r0.locations.length > 0) return true;
@@ -325,7 +336,7 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
 
   const reset = () => {
     setStep('choose'); setMode('without'); setRows([blankRow()]);
-    setEntryDate(todayISO()); setEmployeeName(''); setIsNewEmployee(false);
+    setEntryDate(todayISO()); setEmployeeName(user?.name || ''); setIsNewEmployee(false);
     setInvoiceNo(''); setVendorName(''); setGrnNo(''); setError('');
     setErrors({});
     setScannedFile(null);
@@ -547,7 +558,10 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
     })) { setError('A row has more quantity placed across locations than it received.'); return; }
 
     if (mode === 'with' && !bypassDuplicateCheck) {
-      const existing = invoices.find(inv => inv.Invoice_No.trim().toLowerCase() === invoiceNo.trim().toLowerCase());
+      const existing = invoices.find(inv => 
+        inv.Invoice_No.trim().toLowerCase() === invoiceNo.trim().toLowerCase() &&
+        inv.Vendor_Name.trim().toLowerCase() === vendorName.trim().toLowerCase()
+      );
       if (existing) {
         setDupInvoiceData(existing);
         return;
@@ -706,8 +720,14 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
                       if (errors.employeeName) setErrors(err => ({ ...err, employeeName: '' }));
                     }}
                     onCreateNew={name => {
-                      setEmployeeName(name);
-                      setIsNewEmployee(true);
+                      const match = employees.find(emp => safeStr(emp.Full_Name).trim().toLowerCase() === safeStr(name).trim().toLowerCase());
+                      if (match) {
+                        setEmployeeName(match.Full_Name);
+                        setIsNewEmployee(false);
+                      } else {
+                        setEmployeeName(name);
+                        setIsNewEmployee(true);
+                      }
                       if (errors.employeeName) setErrors(err => ({ ...err, employeeName: '' }));
                     }}
                   />
@@ -915,7 +935,7 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
                       {row.isNewItem && <span className="text-[10px] text-blue-600 font-medium">New item — will be catalogued</span>}
                     </div>
 
-                    <div className="col-span-4 md:col-span-1">
+                    <div className="col-span-6 md:col-span-1">
                       <label className="text-[11px] font-semibold text-gray-500">Qty *</label>
                       <Input 
                         type="number" 
@@ -935,12 +955,12 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
                         <p className="text-[11px] text-red-600 mt-1 font-semibold">{errors[`qty_${row.key}`]}</p>
                       )}
                     </div>
-                    <div className="col-span-4 md:col-span-2">
+                    <div className="col-span-6 md:col-span-2">
                       <label className="text-[11px] font-semibold text-gray-500">Price ₹</label>
                       <Input type="number" min="0" value={row.price} onChange={e => updateRow(row.key, { price: e.target.value })}
                         onPaste={handleFieldPaste(row.key, 2)} className="h-9" />
                     </div>
-                    <div className="col-span-4 md:col-span-1">
+                    <div className="col-span-6 md:col-span-1">
                       <label className="text-[11px] font-semibold text-gray-500">GST %</label>
                       <select value={row.gstRate} onChange={e => updateRow(row.key, { gstRate: e.target.value })}
                         onPaste={handleFieldPaste(row.key, 3)}
@@ -952,7 +972,7 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
                       <label className="text-[11px] font-semibold text-gray-500">Line Total</label>
                       <div className="h-9 flex items-center text-sm font-semibold text-gray-700">₹{lineTotal(row).toFixed(2)}</div>
                     </div>
-                    <div className="col-span-6 md:col-span-2">
+                    <div className="col-span-full md:col-span-2">
                       <label className="text-[11px] font-semibold text-gray-500">Storage Location(s)</label>
                       <div className="mt-1">
                         <LocationPicker rowQty={parseFloat(row.qty || '0')} value={row.locations}
@@ -1032,15 +1052,7 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
           <div className="bg-white rounded-2xl shadow-2xl border border-gray-100 max-w-sm w-full p-6 animate-in zoom-in-95 duration-150" onClick={e => e.stopPropagation()}>
             <h3 className="text-base font-bold text-amber-600 flex items-center gap-2">⚠️ Duplicate Invoice</h3>
             <p className="text-sm text-gray-500 mt-2 leading-relaxed">
-              An invoice with number <strong className="font-mono text-gray-900">{dupInvoiceData.Invoice_No}</strong> already exists:
-            </p>
-            <div className="mt-3 p-3 bg-amber-50/50 rounded-xl border border-amber-100 text-xs text-gray-600 space-y-1">
-              <div><strong>Vendor:</strong> {dupInvoiceData.Vendor_Name}</div>
-              <div><strong>Date:</strong> {dupInvoiceData.Date}</div>
-              <div><strong>Total:</strong> ₹{parseFloat(dupInvoiceData.Total_Value || '0').toLocaleString('en-IN')}</div>
-            </div>
-            <p className="text-xs text-gray-400 mt-3 leading-relaxed">
-              Are you sure you want to proceed and create another invoice with this same number?
+              This invoice number already exists for <strong>{dupInvoiceData.Vendor_Name}</strong> — submitted on <strong>{dupInvoiceData.Date}</strong>. Continue anyway or cancel?
             </p>
             <div className="flex gap-3 mt-5">
               <Button 
@@ -1057,7 +1069,7 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
                 }} 
                 className="flex-1 text-xs font-semibold h-9 rounded-xl bg-amber-600 hover:bg-amber-700 text-white"
               >
-                Proceed
+                Continue anyway
               </Button>
             </div>
           </div>

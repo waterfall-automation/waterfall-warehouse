@@ -13,8 +13,8 @@ import { Badge } from '@/components/ui/badge';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
-import { UserPlus, Search, RefreshCw, EyeOff, Eye } from 'lucide-react';
-import { useUsers, useRoles, useEmployees, useInventoryEntries } from '@/hooks/use-inventory-data';
+import { UserPlus, Search, RefreshCw } from 'lucide-react';
+import { useUsers, useRoles } from '@/hooks/use-inventory-data';
 import { useToast } from '@/hooks/use-toast';
 import { cn } from '@/lib/utils';
 import { flashClick } from '@/lib/click-flash';
@@ -31,8 +31,6 @@ function isVerified(u: User) {
 export default function UsersPage() {
   const { users, addUser, updateUser, deleteUser, loading: loadingUsers } = useUsers();
   const { roles: roleObjects } = useRoles();
-  const { hiddenEmployees, hideEmployee, unhideEmployee } = useEmployees();
-  const { entries } = useInventoryEntries();
   const { toast } = useToast();
   const router = useRouter();
 
@@ -40,10 +38,6 @@ export default function UsersPage() {
   const [search, setSearch] = useState('');
   const [isDemo] = useState(true);
   const [roles, setRoles] = useState<string[]>(['Super Admin','Inventory Lead','Viewer']);
-
-  const allHistoricalEmployees = useMemo(() => {
-    return Array.from(new Set(entries.map(e => e.Employee_Name).filter(Boolean)));
-  }, [entries]);
 
   const [showModal, setShowModal] = useState(false);
   const [editUser, setEditUser] = useState<User|null>(null);
@@ -86,9 +80,9 @@ export default function UsersPage() {
     setSaving(true);
     try {
       if (editUser) {
-        updateUser(editUser.User_ID, form);
+        await updateUser(editUser.User_ID, form);
       } else {
-        addUser(form);
+        await addUser(form);
       }
       setShowModal(false);
     } catch {
@@ -187,7 +181,7 @@ export default function UsersPage() {
                         className="h-7 px-3 text-xs"
                         onClick={async (e) => {
                           e.stopPropagation();
-                          deleteUser(user.User_ID);
+                          await deleteUser(user.User_ID);
                           toast({ title: 'Deleted', description: `${user.Full_Name} removed.` });
                         }}
                       >
@@ -241,75 +235,6 @@ export default function UsersPage() {
                         <span className="text-[11px] text-muted-foreground">{user.Department || 'No department'}</span>
                       </div>
                     </button>
-                  );
-                })}
-              </div>
-            )}
-          </CardContent>
-        </Card>
-
-        <Card className="border-none shadow-md">
-          <CardHeader className="border-b pb-4">
-            <h2 className="text-xl font-bold text-primary flex items-center gap-2">
-              <EyeOff className="h-5 w-5 text-muted-foreground" />
-              Employee Autocomplete Visibility
-            </h2>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              Control which employee names appear in transaction autocomplete suggestions.
-              Hiding a name does not modify any historical transaction records.
-            </p>
-          </CardHeader>
-          <CardContent className="p-4">
-            {allHistoricalEmployees.length === 0 ? (
-              <p className="text-xs text-muted-foreground py-6 text-center">No employee records found in history.</p>
-            ) : (
-              <div className="divide-y max-h-80 overflow-y-auto pr-1">
-                {allHistoricalEmployees.map((name) => {
-                  const isHidden = hiddenEmployees.includes(name);
-                  return (
-                    <div key={name} className="flex justify-between items-center py-2.5 first:pt-0 last:pb-0">
-                      <div className="flex items-center gap-2">
-                        <span className={cn(
-                          "text-sm font-medium",
-                          isHidden ? "text-muted-foreground line-through decoration-muted-foreground/50" : "text-foreground"
-                        )}>
-                          {name}
-                        </span>
-                        {isHidden && (
-                          <Badge variant="outline" className="text-[9px] bg-amber-50 text-amber-700 border-amber-200 font-semibold">
-                            Hidden from suggestions
-                          </Badge>
-                        )}
-                      </div>
-                      <Button
-                        variant={isHidden ? "outline" : "ghost"}
-                        size="sm"
-                        className={cn(
-                          "h-8 text-xs font-semibold gap-1.5",
-                          isHidden ? "border-green-200 hover:bg-green-50 text-green-700 hover:text-green-800" : "text-amber-700 hover:bg-amber-50 hover:text-amber-800"
-                        )}
-                        onClick={(e) => {
-                          flashClick(e);
-                          if (isHidden) {
-                            unhideEmployee(name);
-                          } else {
-                            hideEmployee(name);
-                          }
-                        }}
-                      >
-                        {isHidden ? (
-                          <>
-                            <Eye className="h-3.5 w-3.5" />
-                            Show Suggestions
-                          </>
-                        ) : (
-                          <>
-                            <EyeOff className="h-3.5 w-3.5" />
-                            Hide Suggestions
-                          </>
-                        )}
-                      </Button>
-                    </div>
                   );
                 })}
               </div>

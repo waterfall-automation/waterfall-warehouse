@@ -43,6 +43,28 @@ export default function ItemMasterPage() {
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
   const [calloutFilter, setCalloutFilter] = useState<'location' | 'incomplete' | 'invoice' | 'low-stock' | 'out-of-stock' | 'low-reorder' | 'active' | 'categories' | 'total-items' | null>(null);
 
+  const [dismissedPairs, setDismissedPairs] = useState<string[]>([]);
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem('sicca_dismissed_matches');
+      if (stored) {
+        setDismissedPairs(JSON.parse(stored));
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  }, []);
+
+  const dismissMatch = useCallback((pendingName: string, suggestionCode: string) => {
+    const key = `${pendingName.trim().toLowerCase()}||${suggestionCode.trim().toLowerCase()}`;
+    setDismissedPairs(prev => {
+      const next = [...prev, key];
+      localStorage.setItem('sicca_dismissed_matches', JSON.stringify(next));
+      return next;
+    });
+  }, []);
+
   const filterParam = searchParams.get('filter');
 
   useEffect(() => {
@@ -96,11 +118,15 @@ export default function ItemMasterPage() {
 
     return items
       .map(i => ({ item: i, score: getSimilarity(activePendingItem.Item_Name, i.Item_Name) }))
-      .filter(m => m.score > 0)
+      .filter(m => {
+        if (m.score <= 0) return false;
+        const key = `${activePendingItem.Item_Name.trim().toLowerCase()}||${m.item.Item_Code.trim().toLowerCase()}`;
+        return !dismissedPairs.includes(key);
+      })
       .sort((a, b) => b.score - a.score)
       .slice(0, 3)
       .map(m => m.item);
-  }, [activePendingItem, items]);
+  }, [activePendingItem, items, dismissedPairs]);
 
   useEffect(() => {
     setSelectedMatchCode(null);
@@ -572,9 +598,24 @@ export default function ItemMasterPage() {
                               : "border-gray-200 bg-white hover:border-gray-300 shadow-sm"
                           )}
                         >
-                          <div className="flex justify-between items-start">
-                            <span className="text-xs font-mono text-muted-foreground">{item.Item_Code}</span>
-                            {isSelected && <Badge className="bg-teal-600 text-white border-none text-[9px] h-5">Selected Target</Badge>}
+                          <div className="flex justify-between items-center">
+                            <div className="flex items-center gap-1.5">
+                              <span className="text-xs font-mono text-muted-foreground">{item.Item_Code}</span>
+                              {isSelected && <Badge className="bg-teal-600 text-white border-none text-[9px] h-5">Selected Target</Badge>}
+                            </div>
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              className="h-6 text-[10px] text-red-500 hover:text-red-700 hover:bg-red-50 px-1.5 py-0.5"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                if (window.confirm(`Mark "${activePendingItem.Item_Name}" as NOT a match for "${item.Item_Name}"? You won't see this suggestion again.`)) {
+                                  dismissMatch(activePendingItem.Item_Name, item.Item_Code);
+                                }
+                              }}
+                            >
+                              Not a Match
+                            </Button>
                           </div>
                           <p className="font-bold text-sm text-gray-900 leading-snug mt-1">{item.Item_Name}</p>
                           

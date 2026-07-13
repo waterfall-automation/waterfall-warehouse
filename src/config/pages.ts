@@ -20,6 +20,7 @@ export const PAGE_CONFIG = {
   activityLog:   true,   // Activity log / audit trail
   recycleBin:    true,   // Recycle bin for deleted entries
   settings:      true,   // App settings
+  help:          true,   // Help and FAQ page
 } as const;
 
 export type PageKey = keyof typeof PAGE_CONFIG;

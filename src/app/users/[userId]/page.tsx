@@ -9,8 +9,9 @@ import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Checkbox } from '@/components/ui/checkbox';
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar';
-import { ArrowLeft, ChevronDown, ShieldCheck, History, Activity, FileText, CheckSquare } from 'lucide-react';
+import { ArrowLeft, ChevronDown, ShieldCheck, History, Activity, FileText, CheckSquare, Trash2 } from 'lucide-react';
 import { useUsers, useInventoryEntries, useTasks, useLocalState } from '@/hooks/use-inventory-data';
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
 import { cn, safeStr } from '@/lib/utils';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { Badge } from '@/components/ui/badge';
@@ -73,7 +74,7 @@ export default function UserProfilePage() {
   const router = useRouter();
   const userId = String(params.userId);
   const { user: currentUser } = useAuth();
-  const { users, updateUser, loading } = useUsers();
+  const { users, updateUser, deleteUser, loading } = useUsers();
   const user = users.find(u => u.User_ID === userId) as any;
 
   const { entries } = useInventoryEntries();
@@ -84,6 +85,8 @@ export default function UserProfilePage() {
   const [expanded, setExpanded] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [loaded, setLoaded] = useState(false);
+  const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
 
   // This editor manages access itself — Admin-only, regardless of whether the
   // viewer otherwise has generic "users" page access (e.g. to see the list).
@@ -177,17 +180,29 @@ export default function UserProfilePage() {
 
         {/* Personal details */}
         <Card className="border-none shadow-md">
-          <CardContent className="p-6 flex items-center gap-4">
-            <Avatar className="h-16 w-16 shrink-0">
-              {user.Photo_URL && <AvatarImage src={user.Photo_URL} alt={user.Full_Name} />}
-              <AvatarFallback className="bg-primary/10 text-primary text-lg font-bold">{initials}</AvatarFallback>
-            </Avatar>
-            <div className="min-w-0 flex-1">
-              <div className="flex items-center gap-2 flex-wrap">
-                <h1 className="text-xl font-bold">{user.Full_Name}{!verified && <span className="text-red-500">*</span>}</h1>
-                {!verified && <span className="text-[10px] font-bold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">Unverified</span>}
+          <CardContent className="p-6 flex items-center justify-between gap-4">
+            <div className="flex items-center gap-4 min-w-0 flex-1">
+              <Avatar className="h-16 w-16 shrink-0">
+                {user.Photo_URL && <AvatarImage src={user.Photo_URL} alt={user.Full_Name} />}
+                <AvatarFallback className="bg-primary/10 text-primary text-lg font-bold">{initials}</AvatarFallback>
+              </Avatar>
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <h1 className="text-xl font-bold">{user.Full_Name}{!verified && <span className="text-red-500">*</span>}</h1>
+                  {!verified && <span className="text-[10px] font-bold bg-amber-100 text-amber-700 px-2 py-0.5 rounded-full">Unverified</span>}
+                </div>
+                <p className="text-sm text-muted-foreground">{user.Role} · {user.Department || 'No department set'}</p>
               </div>
-              <p className="text-sm text-muted-foreground">{user.Role} · {user.Department || 'No department set'}</p>
+            </div>
+            <div className="shrink-0">
+              <Button
+                variant="outline"
+                size="icon"
+                onClick={() => setShowDeleteConfirm(true)}
+                className="text-red-600 hover:text-red-700 hover:bg-red-50 border-red-200"
+              >
+                <Trash2 className="h-4 w-4" />
+              </Button>
             </div>
           </CardContent>
         </Card>
@@ -349,6 +364,84 @@ export default function UserProfilePage() {
           </CardContent>
         </Card>
       </div>
+
+      {showDeleteConfirm && (
+        <Dialog open={showDeleteConfirm} onOpenChange={setShowDeleteConfirm}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle className="text-red-600 flex items-center gap-2">
+                <Trash2 className="h-5 w-5 text-red-600" /> Delete User Profile?
+              </DialogTitle>
+            </DialogHeader>
+
+            <div className="space-y-4 py-2 text-sm text-muted-foreground">
+              <p>
+                Are you sure you want to delete user <strong className="text-foreground">{user.Full_Name}</strong> ({user.Email})?
+              </p>
+
+              <div className="rounded-xl border bg-muted/20 p-4 space-y-4">
+                <p className="text-xs font-semibold text-foreground uppercase tracking-wider">Choose Deletion Option:</p>
+                
+                {/* Option A */}
+                <div className="space-y-1">
+                  <Button
+                    variant="outline"
+                    className="w-full justify-start text-left border-border text-foreground hover:bg-accent font-semibold h-auto py-2.5 px-3 flex flex-col items-start gap-1"
+                    onClick={async () => {
+                      setIsDeleting(true);
+                      await deleteUser(user.User_ID, false);
+                      setIsDeleting(false);
+                      setShowDeleteConfirm(false);
+                      router.push('/users');
+                    }}
+                    disabled={isDeleting}
+                  >
+                    <span className="text-xs text-primary font-bold">Option A: Delete User Only</span>
+                    <span className="text-[11px] font-normal text-muted-foreground leading-normal">
+                      Removes user login/profile. Keep their name as plain text on existing transactions ({userEntries.length}) and tasks ({userTasks.length}). Restorable via Recycle Bin.
+                    </span>
+                  </Button>
+                </div>
+
+                {/* Option B */}
+                <div className="space-y-1">
+                  <Button
+                    variant="destructive"
+                    className="w-full justify-start text-left font-semibold h-auto py-2.5 px-3 flex flex-col items-start gap-1 bg-red-600 hover:bg-red-700 text-white"
+                    onClick={async () => {
+                      setIsDeleting(true);
+                      await deleteUser(user.User_ID, true);
+                      setIsDeleting(false);
+                      setShowDeleteConfirm(false);
+                      router.push('/users');
+                    }}
+                    disabled={isDeleting}
+                  >
+                    <span className="text-xs text-white font-bold">Option B: Delete User + Cascade History</span>
+                    <span className="text-[11px] font-normal text-red-100 leading-normal">
+                      Removes user login/profile AND deletes/cascades all {userEntries.length} associated Stock Register entries and {userTasks.length} assigned tasks.
+                    </span>
+                  </Button>
+                  <p className="text-[10px] text-amber-600 font-medium px-1 mt-1">
+                    * Warning: Option B's cascade deletion of transactions/tasks is permanent and NOT recoverable via the Recycle Bin.
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <DialogFooter className="gap-2 flex flex-col sm:flex-row border-t pt-4">
+              <Button
+                variant="ghost"
+                onClick={() => setShowDeleteConfirm(false)}
+                disabled={isDeleting}
+                className="w-full sm:w-auto"
+              >
+                Cancel
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
     </AppShell>
   );
 }
