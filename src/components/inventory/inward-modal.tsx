@@ -626,7 +626,7 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
                 invoiceNo: invoiceNo.trim(),
                 vendorName: vendorName.trim(),
                 date: toDisplayDateTime(entryDate).split(' ')[0],
-                token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+                token: localStorage.getItem('sicca_token') || ''
               })
             });
             const uploadJson = await uploadRes.json();

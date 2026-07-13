@@ -90,7 +90,7 @@ export function addSystemLog(action: string, target: string) {
   
   let currentUserName = 'Admin';
   try {
-    const userStr = localStorage.getItem('sicca_current_user');
+    const userStr = localStorage.getItem('sicca_user');
     if (userStr) {
       const parsed = JSON.parse(userStr);
       if (parsed?.name) currentUserName = parsed.name;
@@ -370,7 +370,7 @@ export function useInventoryEntries() {
         headers: { 'Content-Type': 'text/plain' },
         body: JSON.stringify({
           action: 'saveInwardBatch',
-          token: localStorage.getItem('sicca_session_token') || 'demo-admin-token',
+          token: localStorage.getItem('sicca_token') || '',
           ...payload
         })
       });
@@ -611,7 +611,7 @@ export function useUsers() {
                 body: JSON.stringify({
                   action: 'deleteEntry',
                   entryId: entry.Entry_ID,
-                  token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+                  token: localStorage.getItem('sicca_token') || ''
                 })
               }).then(res => res.json()),
               `Cascade delete entry ${entry.Entry_ID}`
@@ -637,7 +637,7 @@ export function useUsers() {
                   action: 'updateTaskStatus',
                   taskId: task.Task_ID,
                   status: 'Deleted',
-                  token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+                  token: localStorage.getItem('sicca_token') || ''
                 })
               }).then(res => res.json()),
               `Cascade delete task ${task.Task_ID}`
@@ -831,7 +831,7 @@ export function useNoticeBoard() {
             priority: form.priority || 'info',
             expiry: form.expiry || '',
             taggedUsers: form.taggedUsers || [],
-            token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+            token: localStorage.getItem('sicca_token') || ''
           })
         }).then(res => res.json()),
         `Create notice: ${form.title}`
@@ -859,7 +859,7 @@ export function useNoticeBoard() {
           body: JSON.stringify({
             action: 'deleteNotice',
             noticeId,
-            token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+            token: localStorage.getItem('sicca_token') || ''
           })
         }).then(res => res.json()),
         `Delete notice ID ${noticeId}`
@@ -2341,7 +2341,7 @@ export function useTasks() {
               action: 'updateTaskStatus',
               taskId,
               status,
-              token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+              token: localStorage.getItem('sicca_token') || ''
             })
           }).then(res => res.json()),
           `Update task ID ${taskId} status to ${status}`
