@@ -36,24 +36,6 @@ export default function ItemDetailPage() {
     return items.find(i => i.Item_ID === itemId || i.Item_Code === itemId);
   }, [items, itemId]);
 
-  if (isLoading && !item) {
-    return (
-      <AppShell>
-        <div className="flex flex-col items-center justify-center py-32 space-y-4">
-          <div className="relative flex items-center justify-center">
-            {/* Animated outer ring */}
-            <div className="absolute w-12 h-12 rounded-full border-2 border-indigo-600/20 border-t-indigo-600 animate-spin" />
-            {/* Inner pulsing center */}
-            <div className="w-6 h-6 rounded-full bg-indigo-600/10 animate-pulse" />
-          </div>
-          <span className="text-[10px] font-bold text-muted-foreground font-mono uppercase tracking-widest mt-2 animate-pulse">
-            Fetching Catalog Specs...
-          </span>
-        </div>
-      </AppShell>
-    );
-  }
-
   // Filter transaction entries for the item
   const itemEntries = useMemo(() => {
     if (!item) return [];
@@ -115,6 +97,24 @@ export default function ItemDetailPage() {
       return sum + inQty - outQty;
     }, 0);
   };
+
+  if (isLoading && !item) {
+    return (
+      <AppShell>
+        <div className="flex flex-col items-center justify-center py-32 space-y-4">
+          <div className="relative flex items-center justify-center">
+            {/* Animated outer ring */}
+            <div className="absolute w-12 h-12 rounded-full border-2 border-indigo-600/20 border-t-indigo-600 animate-spin" />
+            {/* Inner pulsing center */}
+            <div className="w-6 h-6 rounded-full bg-indigo-600/10 animate-pulse" />
+          </div>
+          <span className="text-[10px] font-bold text-muted-foreground font-mono uppercase tracking-widest mt-2 animate-pulse">
+            Fetching Catalog Specs...
+          </span>
+        </div>
+      </AppShell>
+    );
+  }
 
   if (!item) {
     return (
