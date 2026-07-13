@@ -1,7 +1,15 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { useToast } from '@/hooks/use-toast';
+import { useState, useEffect, useCallback, useMemo, Dispatch, SetStateAction } from 'react';
+import { useToast, toast } from '@/hooks/use-toast';
 import { fetchSheetTab, postSheetRow } from '@/lib/sheets';
 import { safeStr } from '@/lib/utils';
+import {
+  getCached,
+  subscribe as subscribeSync,
+  fullSync,
+  queueWrite,
+  registerOnFailure,
+  idbSet
+} from '@/lib/sync-engine';
 import {
   Entry, ItemSummary, User, Role, Notice, RecycleItem, ActivityLog,
   Cupboard, CupItem, Vendor, ItemMaster, Box, Placement, Invoice,
@@ -13,6 +21,17 @@ import {
 } from '@/lib/demo-data';
 
 const isClient = typeof window !== 'undefined';
+
+// Wire registerOnFailure once at the module level
+if (isClient) {
+  registerOnFailure((error, description) => {
+    toast({
+      title: 'Sync Write Failed',
+      description: `${description}: ${error.message}`,
+      variant: 'destructive'
+    });
+  });
+}
 
 function getStored<T>(key: string, initial: T): T {
   if (!isClient) return initial;
@@ -31,7 +50,6 @@ function setStored<T>(key: string, value: T) {
   } catch {}
 }
 
-// Helpers to update local storage and notify listeners
 const listeners: Record<string, Function[]> = {};
 
 function subscribe(key: string, listener: Function) {
@@ -69,13 +87,7 @@ export function useLocalState<T>(key: string, initial: T): [T, (val: T | ((curr:
 // Global Activity Log helper
 export function addSystemLog(action: string, target: string) {
   if (!isClient) return;
-  const logs = getStored<ActivityLog[]>('sicca_activity_log', DEMO_ACTIVITY_LOG);
-  const now = new Date();
-  const formatTime = (d: Date) => {
-    const p = (n: number) => String(n).padStart(2, '0');
-    return `${p(d.getDate())}-${p(d.getMonth()+1)}-${d.getFullYear()} ${p(d.getHours())}:${p(d.getMinutes())}`;
-  };
-
+  
   let currentUserName = 'Admin';
   try {
     const userStr = localStorage.getItem('sicca_current_user');
@@ -90,10 +102,25 @@ export function addSystemLog(action: string, target: string) {
     User_Name: currentUserName,
     Action: action,
     Target: target,
-    Date_Time: formatTime(now)
+    Date_Time: new Date().toLocaleString()
   };
-  setStored('sicca_activity_log', [newLog, ...logs]);
-  notify('sicca_activity_log');
+
+  getCached('Activity_Log').then(async (cached) => {
+    const logs = cached?.data || DEMO_ACTIVITY_LOG;
+    const nextLogs = [newLog, ...logs];
+    await idbSet('Activity_Log', { data: nextLogs, syncedAt: Date.now() });
+    window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Activity_Log', data: nextLogs } }));
+  }).catch(err => {
+    console.error('Failed to update Activity_Log cache:', err);
+  });
+
+  queueWrite(
+    () => postSheetRow('Activity_Log', newLog),
+    `System log: ${action} - ${target}`,
+    { type: 'postRow', tabName: 'Activity_Log', rowData: newLog }
+  ).catch(err => {
+    console.error('Failed to queue system log write:', err);
+  });
 }
 
 function computeSummary(entries: Entry[]): ItemSummary[] {
@@ -131,54 +158,116 @@ function computeSummary(entries: Entry[]): ItemSummary[] {
   });
 }
 
-// 1. INVENTORY ENTRIES HOOK
-export function useInventoryEntries() {
-  const [entries, setEntries] = useLocalState<Entry[]>('sicca_inventory_entries', DEMO_INVENTORY_ENTRIES);
-  const [itemSummary, setItemSummary] = useLocalState<ItemSummary[]>('sicca_item_summary', DEMO_ITEM_SUMMARY);
-  const [recycleBin, setRecycleBin] = useLocalState<RecycleItem[]>('sicca_recycle_bin', DEMO_RECYCLE_BIN);
-  const { toast } = useToast();
+function processStockRegister(data: any[]): Entry[] {
+  const entryMap = new Map<string, Entry>();
+  data.forEach((e: any) => {
+    if (e.Entry_ID) {
+      entryMap.set(e.Entry_ID, e);
+    }
+  });
+  const activeEntries = Array.from(entryMap.values());
+  return activeEntries.reverse();
+}
+
+function updateRawData(rawData: any[], newRow: any, idKey: string): any[] {
+  const idx = rawData.findIndex(item => item[idKey] && String(item[idKey]).trim().toLowerCase() === String(newRow[idKey]).trim().toLowerCase());
+  if (idx > -1) {
+    const next = [...rawData];
+    next[idx] = { ...next[idx], ...newRow };
+    return next;
+  } else {
+    return [...rawData, newRow];
+  }
+}
+
+async function updateLocalCache(tab: string, newRow: any, idKey: string) {
+  const cached = await getCached(tab);
+  const raw = cached?.data || [];
+  const nextRaw = updateRawData(raw, newRow, idKey);
+  await idbSet(tab, { data: nextRaw, syncedAt: Date.now() });
+  window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab, data: nextRaw } }));
+}
+
+async function filterLocalCache(tab: string, filterFn: (item: any) => boolean) {
+  const cached = await getCached(tab);
+  const raw = cached?.data || [];
+  const nextRaw = raw.filter(filterFn);
+  await idbSet(tab, { data: nextRaw, syncedAt: Date.now() });
+  window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab, data: nextRaw } }));
+}
+
+// DRY Hook for Sync Engine tabs
+export function useSyncTabState<T>(
+  tabName: string,
+  initialData: T[],
+  processFn?: (data: any[]) => T[]
+): [T[], Dispatch<SetStateAction<T[]>>, boolean] {
+  const [state, setState] = useState<T[]>(initialData);
   const [loading, setLoading] = useState(true);
 
-  const loadFromBackend = useCallback(async (isInitial = false) => {
-    if (isInitial) setLoading(true);
-    try {
-      const data = await fetchSheetTab('database', 'Stock_Register');
-      if (data && data.length > 0) {
-        // Deduplicate: take the latest entry by Entry_ID
-        const entryMap = new Map<string, Entry>();
-        data.forEach((e: any) => {
-          if (e.Entry_ID) {
-            entryMap.set(e.Entry_ID, e);
-          }
-        });
-        const activeEntries = Array.from(entryMap.values());
-        const reversed = activeEntries.reverse();
-        setEntries(reversed);
-        setItemSummary(computeSummary(reversed));
-      }
-    } catch (err: any) {
-      console.error('fetchSheetTab failed:', err);
-      // Fallback: show toast only on initial mount to avoid polling spam
-      if (isInitial) {
-        toast({
-          title: 'Showing demo data',
-          description: 'Backend unreachable. Using local fallback.',
-          variant: 'destructive'
-        });
-      }
-    } finally {
-      if (isInitial) setLoading(false);
-    }
-  }, [setEntries, setItemSummary, toast]);
-
   useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => {
-      loadFromBackend(false);
-    }, delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
+    let active = true;
+    async function load() {
+      try {
+        const cached = await getCached(tabName);
+        if (!active) return;
+        if (cached && cached.data && cached.data.length > 0) {
+          setState(processFn ? processFn(cached.data) : cached.data);
+          setLoading(false);
+        } else {
+          const data = await fetchSheetTab('database', tabName);
+          if (!active) return;
+          if (data && data.length > 0) {
+            await idbSet(tabName, { data, syncedAt: Date.now() });
+            setState(processFn ? processFn(data) : data);
+          } else {
+            setState(initialData);
+          }
+          setLoading(false);
+        }
+      } catch (err) {
+        console.error(`Failed to load initial cache for ${tabName}:`, err);
+        if (active) {
+          setState(initialData);
+          setLoading(false);
+        }
+      }
+    }
+    load();
+
+    const unsub = subscribeSync((tab, data) => {
+      if (!active) return;
+      if (tab === tabName && data) {
+        setState(processFn ? processFn(data) : data);
+        setLoading(false);
+      }
+    });
+
+    const handleCustom = (e: Event) => {
+      if (!active) return;
+      const detail = (e as CustomEvent).detail;
+      if (detail.tab === tabName && detail.data) {
+        setState(processFn ? processFn(detail.data) : detail.data);
+        setLoading(false);
+      }
+    };
+    window.addEventListener('sync-tab-updated', handleCustom);
+
+    return () => {
+      active = false;
+      unsub();
+      window.removeEventListener('sync-tab-updated', handleCustom);
+    };
+  }, [tabName, initialData, processFn]);
+
+  return [state, setState, loading];
+}
+
+// 1. INVENTORY ENTRIES HOOK
+export function useInventoryEntries() {
+  const [entries, setEntries, loading] = useSyncTabState<Entry>('Stock_Register', DEMO_INVENTORY_ENTRIES, processStockRegister);
+  const itemSummary = useMemo(() => computeSummary(entries), [entries]);
+  const { toast } = useToast();
 
   const addEntry = useCallback(async (form: any, opts?: { silent?: boolean }) => {
     const type = form.transactionType || 'Inward';
@@ -192,13 +281,11 @@ export function useInventoryEntries() {
     const cgst = (taxable * gst) / 200;
     const total = taxable + cgst * 2;
     
-    // Find current balance for the item
     let currentBalance = 0;
     const existingSummary = itemSummary.find(i => safeStr(i.name).toLowerCase() === safeStr(form.itemName).toLowerCase());
     if (existingSummary) {
       currentBalance = existingSummary.balance;
     }
-
     const nextBalance = (type === 'Inward' || type === 'Return') ? currentBalance + qty : currentBalance - qty;
 
     const maxNum = entries.reduce((max, e) => {
@@ -248,47 +335,30 @@ export function useInventoryEntries() {
     };
 
     try {
-      await postSheetRow('Stock_Register', rowData);
-      
-      // Optimistic update
-      setEntries(prev => [rowData as any, ...prev]);
-      setItemSummary(prev => {
-        const existingIdx = prev.findIndex(i => safeStr(i.name).toLowerCase() === safeStr(form.itemName).toLowerCase());
-        const minStock = 10;
-        const status = nextBalance <= 0 ? 'Out of Stock' : (nextBalance < minStock ? 'Low' : 'Normal');
-
-        if (existingIdx > -1) {
-          const updated = [...prev];
-          updated[existingIdx] = {
-            ...updated[existingIdx],
-            balance: nextBalance,
-            status,
-            location: form.location || updated[existingIdx].location
-          };
-          return updated;
-        } else {
-          return [...prev, {
-            name: form.itemName,
-            code: form.itemCode || 'N/A',
-            balance: nextBalance,
-            location: form.location || 'Default',
-            status
-          }];
-        }
-      });
+      // Optimistic cache update
+      await updateLocalCache('Stock_Register', rowData, 'Entry_ID');
 
       addSystemLog(type === 'Inward' ? 'INWARD_ENTRY' : type === 'Return' ? 'RETURN_ENTRY' : 'OUTWARD_ENTRY', `${form.itemName} × ${qty}`);
       if (!opts?.silent) toast({ title: 'Success', description: `${type} entry added for ${form.itemName}.` });
+
+      // Queue network write
+      const description = `Add ${type} entry for ${form.itemName} (ID: ${nextId})`;
+      queueWrite(
+        () => postSheetRow('Stock_Register', rowData),
+        description,
+        { type: 'postRow', tabName: 'Stock_Register', rowData }
+      ).catch(err => console.error("Failed to queue Stock_Register write:", err));
+
       return { success: true, entryId: nextId };
     } catch (err: any) {
       if (!opts?.silent) toast({
-        title: 'Network Error',
-        description: 'Failed to write to Google Sheets. ' + err.message,
+        title: 'Error',
+        description: 'Failed to update local state: ' + err.message,
         variant: 'destructive'
       });
       return { success: false, error: err.message };
     }
-  }, [itemSummary, setEntries, setItemSummary, toast]);
+  }, [entries, itemSummary, toast]);
 
   const saveInwardBatch = useCallback(async (payload: any) => {
     try {
@@ -321,11 +391,10 @@ export function useInventoryEntries() {
     }
   }, [toast]);
 
-  const deleteEntry = useCallback((entryId: string) => {
+  const deleteEntry = useCallback(async (entryId: string) => {
     const entryToDelete = entries.find(e => e.Entry_ID === entryId);
     if (!entryToDelete) return { success: false, error: 'Entry not found' };
 
-    // Move to recycle bin
     const newBinItem: RecycleItem = {
       Bin_ID: 'BIN-' + Date.now(),
       Original_ID: entryToDelete.Entry_ID,
@@ -334,20 +403,25 @@ export function useInventoryEntries() {
       Deleted_By: 'Admin',
       Date_Time: new Date().toLocaleString()
     };
-    setRecycleBin(prev => [newBinItem, ...prev]);
-    setEntries(prev => prev.filter(e => e.Entry_ID !== entryId));
 
-    // Also backup the deleted entry object for restoration
-    if (isClient) {
-      const backups = getStored<Record<string, any>>('sicca_entry_backups', {});
-      backups[newBinItem.Bin_ID] = entryToDelete;
-      setStored('sicca_entry_backups', backups);
+    try {
+      await filterLocalCache('Stock_Register', e => e.Entry_ID !== entryId);
+      await updateLocalCache('Recycle_Bin', newBinItem, 'Bin_ID');
+
+      if (isClient) {
+        const backups = getStored<Record<string, any>>('sicca_entry_backups', {});
+        backups[newBinItem.Bin_ID] = entryToDelete;
+        setStored('sicca_entry_backups', backups);
+      }
+
+      addSystemLog('DELETE_ENTRY', `${entryToDelete.Item_Name} stock entry deleted`);
+      toast({ title: 'Deleted', description: 'Stock entry moved to Recovery Vault.' });
+      return { success: true };
+    } catch (err: any) {
+      toast({ title: 'Error', description: 'Failed to delete entry: ' + err.message, variant: 'destructive' });
+      return { success: false, error: err.message };
     }
-
-    addSystemLog('DELETE_ENTRY', `${entryToDelete.Item_Name} stock entry deleted`);
-    toast({ title: 'Deleted', description: 'Stock entry moved to Recovery Vault.' });
-    return { success: true };
-  }, [entries, setEntries, setRecycleBin, toast]);
+  }, [entries, toast]);
 
   return {
     entries,
@@ -356,24 +430,27 @@ export function useInventoryEntries() {
     saveInwardBatch,
     deleteEntry,
     loading,
-    refresh: () => loadFromBackend(true)
+    refresh: () => {
+      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    }
   };
 }
 
 // 2. DASHBOARD HOOK
 export function useDashboardStats() {
-  const { entries, items, loading } = useInventoryEntries();
-  const [vendors] = useLocalState<Vendor[]>('sicca_vendors', DEMO_VENDORS);
-  const [users] = useLocalState<User[]>('sicca_users', DEMO_USERS);
+  const { entries, items, loading: loadingEntries } = useInventoryEntries();
+  const { vendors, loading: loadingVendors } = useVendors();
+  const { users, loading: loadingUsers } = useUsers();
 
   const totalItems = items.length;
   const lowStock = items.filter(i => i.status === 'Low').length;
   const outOfStock = items.filter(i => i.status === 'Out of Stock').length;
   const todayCount = entries.filter(e => {
     const todayStr = new Date().toLocaleDateString('en-IN');
-    // entries have Date_Time like "03-07-2026 14:30" or LocaleString
     return e.Date_Time.includes(todayStr) || e.Date_Time.includes('03-07-2026');
   }).length;
+
+  const loading = loadingEntries || loadingVendors || loadingUsers;
 
   return {
     stats: {
@@ -387,40 +464,16 @@ export function useDashboardStats() {
     totalVendors: vendors.length,
     totalUsers: users.length,
     loading,
-    refresh: () => {}
+    refresh: () => {
+      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    }
   };
 }
 
 // 3. USERS HOOK
 export function useUsers() {
-  const [users, setUsers] = useLocalState<User[]>('sicca_users', DEMO_USERS);
-  const [recycleBin, setRecycleBin] = useLocalState<RecycleItem[]>('sicca_recycle_bin', DEMO_RECYCLE_BIN);
+  const [users, setUsers, loading] = useSyncTabState<User>('Users', DEMO_USERS, data => data.filter(u => u.Status !== 'Deleted'));
   const { toast } = useToast();
-  const [loading, setLoading] = useState(true);
-
-  const loadFromBackend = useCallback(async (isInitial = false) => {
-    if (isInitial) setLoading(true);
-    try {
-      const raw = await fetchSheetTab('database', 'Users');
-      const userMap = new Map<string, User>();
-      raw.forEach((u: any) => { if (u.User_ID) userMap.set(u.User_ID, u); });
-      setUsers(Array.from(userMap.values()).filter((u: any) => u.Status !== 'Deleted'));
-    } catch (err: any) {
-      console.error('Failed to load users:', err);
-      if (isInitial) {
-        toast({ title: 'Showing demo data — backend unreachable', description: 'Using local fallback data.', variant: 'destructive' });
-      }
-    } finally {
-      if (isInitial) setLoading(false);
-    }
-  }, [setUsers, toast]);
-
-  useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => loadFromBackend(false), delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
 
   const addUser = useCallback(async (form: any) => {
     const maxNum = users.reduce((max, u) => {
@@ -437,17 +490,27 @@ export function useUsers() {
       Permissions: JSON.stringify(form.permissions || {}),
       Created_On: new Date().toLocaleString()
     };
+
     try {
-      await postSheetRow('Users', newUser);
-      setUsers(prev => [...prev, newUser as any]);
+      await updateLocalCache('Users', newUser, 'User_ID');
+
       addSystemLog('CREATE_USER', `${newUser.Full_Name} created`);
       toast({ title: 'Success', description: `User ${newUser.Full_Name} created successfully.` });
+
+      // Queue write
+      const description = `Create User ${newUser.Full_Name}`;
+      queueWrite(
+        () => postSheetRow('Users', newUser),
+        description,
+        { type: 'postRow', tabName: 'Users', rowData: newUser }
+      ).catch(err => console.error("Failed to queue Users write:", err));
+
       return { success: true, userId: id };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to write to Google Sheets. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to update local state: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [users, setUsers, toast]);
+  }, [users, toast]);
 
   const updateUser = useCallback(async (userId: string, form: any) => {
     const existing: any = users.find(u => u.User_ID === userId);
@@ -466,26 +529,39 @@ export function useUsers() {
       Permissions: form.permissions !== undefined ? JSON.stringify(form.permissions) : existing?.Permissions || '{}',
       Created_On: existing?.Created_On || new Date().toLocaleString()
     };
+
     try {
-      await postSheetRow('Users', updated);
-      setUsers(prev => prev.map(u => u.User_ID === userId ? { ...u, ...updated } as any : u));
+      await updateLocalCache('Users', updated, 'User_ID');
+
       addSystemLog('UPDATE_USER', `User ID ${userId} updated`);
       toast({ title: 'Updated', description: 'User account updated.' });
+
+      // Queue write
+      const description = `Update User ${updated.Full_Name}`;
+      queueWrite(
+        () => postSheetRow('Users', updated),
+        description,
+        { type: 'postRow', tabName: 'Users', rowData: updated }
+      ).catch(err => console.error("Failed to queue User update:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to update Google Sheets. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to update local state: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [users, setUsers, toast]);
+  }, [users, toast]);
 
-  const deleteUser = useCallback(async (userId: string) => {
+  const deleteUser = useCallback(async (userId: string, cascade = false) => {
     const userToDelete = users.find(u => u.User_ID === userId);
     if (!userToDelete) return { success: false };
 
     const deletedUser = { ...userToDelete, Status: 'Deleted' };
+
     try {
-      await postSheetRow('Users', deletedUser);
-      
+      // 1. Update Users cache
+      await updateLocalCache('Users', deletedUser, 'User_ID');
+
+      // 2. Add to Recycle Bin
       const newBinItem: RecycleItem = {
         Bin_ID: 'BIN-' + Date.now(),
         Original_ID: userToDelete.User_ID,
@@ -494,8 +570,7 @@ export function useUsers() {
         Deleted_By: 'Admin',
         Date_Time: new Date().toLocaleString()
       };
-      setRecycleBin(prev => [newBinItem, ...prev]);
-      setUsers(prev => prev.filter(u => u.User_ID !== userId));
+      await updateLocalCache('Recycle_Bin', newBinItem, 'Bin_ID');
 
       if (isClient) {
         const backups = getStored<Record<string, any>>('sicca_user_backups', {});
@@ -503,19 +578,108 @@ export function useUsers() {
         setStored('sicca_user_backups', backups);
       }
 
-      addSystemLog('DELETE_USER', `${userToDelete.Full_Name} deleted`);
-      toast({ title: 'Deleted', description: 'User moved to Recovery Vault.' });
+      // Queue User deletion write
+      queueWrite(
+        () => postSheetRow('Users', deletedUser),
+        `Delete User ${userToDelete.Full_Name}`,
+        { type: 'postRow', tabName: 'Users', rowData: deletedUser }
+      ).catch(err => console.error("Failed to queue User delete:", err));
+
+      if (cascade) {
+        const urlStr = process.env.NEXT_PUBLIC_SHEETS_API_URL;
+
+        // Cascade delete Stock Register entries
+        const cachedEntries = await getCached('Stock_Register');
+        const rawEntries = cachedEntries?.data || [];
+        const affectedEntries = rawEntries.filter(e =>
+          safeStr(e.Employee_Name).toLowerCase() === safeStr(userToDelete.Full_Name).toLowerCase() ||
+          safeStr(e.Issued_To).toLowerCase() === safeStr(userToDelete.Full_Name).toLowerCase()
+        );
+        const remainingEntries = rawEntries.filter(e =>
+          safeStr(e.Employee_Name).toLowerCase() !== safeStr(userToDelete.Full_Name).toLowerCase() &&
+          safeStr(e.Issued_To).toLowerCase() !== safeStr(userToDelete.Full_Name).toLowerCase()
+        );
+        await idbSet('Stock_Register', { data: remainingEntries, syncedAt: Date.now() });
+        window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Stock_Register', data: remainingEntries } }));
+
+        if (urlStr) {
+          for (const entry of affectedEntries) {
+            queueWrite(
+              () => fetch(urlStr, {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain' },
+                body: JSON.stringify({
+                  action: 'deleteEntry',
+                  entryId: entry.Entry_ID,
+                  token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+                })
+              }).then(res => res.json()),
+              `Cascade delete entry ${entry.Entry_ID}`
+            ).catch(err => console.warn('Backend entry cascade delete failed:', err));
+          }
+        }
+
+        // Cascade delete tasks
+        const cachedTasks = await getCached('Tasks');
+        const rawTasks = cachedTasks?.data || [];
+        const affectedTasks = rawTasks.filter(t => t.Assigned_To_User_ID === userId);
+        const remainingTasks = rawTasks.filter(t => t.Assigned_To_User_ID !== userId);
+        await idbSet('Tasks', { data: remainingTasks, syncedAt: Date.now() });
+        window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Tasks', data: remainingTasks } }));
+
+        if (urlStr) {
+          for (const task of affectedTasks) {
+            queueWrite(
+              () => fetch(urlStr, {
+                method: 'POST',
+                headers: { 'Content-Type': 'text/plain' },
+                body: JSON.stringify({
+                  action: 'updateTaskStatus',
+                  taskId: task.Task_ID,
+                  status: 'Deleted',
+                  token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+                })
+              }).then(res => res.json()),
+              `Cascade delete task ${task.Task_ID}`
+            ).catch(err => console.warn('Backend task cascade delete failed:', err));
+          }
+        }
+
+        addSystemLog('DELETE_USER_CASCADE', `${userToDelete.Full_Name} deleted with cascade (removed ${affectedEntries.length} entries, ${affectedTasks.length} tasks)`);
+        toast({ title: 'Deleted', description: `User removed with cascade deletion of associated transactions and tasks.` });
+      } else {
+        addSystemLog('DELETE_USER', `${userToDelete.Full_Name} deleted (retained history)`);
+        toast({ title: 'Deleted', description: 'User moved to Recovery Vault.' });
+      }
+
       return { success: true };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to delete user. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to delete user: ' + err.message, variant: 'destructive' });
       return { success: false };
     }
-  }, [users, setUsers, setRecycleBin, toast]);
+  }, [users, toast]);
 
-  const toggleUserStatus = useCallback((userId: string, status: string) => {
-    setUsers(prev => prev.map(u => u.User_ID === userId ? { ...u, Status: status as any } : u));
-    return { success: true };
-  }, [setUsers]);
+  const toggleUserStatus = useCallback(async (userId: string, status: string) => {
+    const userToToggle = users.find(u => u.User_ID === userId);
+    if (!userToToggle) return { success: false };
+    const updated = { ...userToToggle, Status: status as any };
+
+    try {
+      await updateLocalCache('Users', updated, 'User_ID');
+
+      // Queue write
+      queueWrite(
+        () => postSheetRow('Users', updated),
+        `Toggle User ${userToToggle.Full_Name} status to ${status}`,
+        { type: 'postRow', tabName: 'Users', rowData: updated }
+      ).catch(err => console.error("Failed to queue user toggle:", err));
+
+      return { success: true };
+    } catch (err: any) {
+      console.error(err);
+      return { success: false };
+    }
+  }, [users]);
 
   return {
     users,
@@ -524,90 +688,120 @@ export function useUsers() {
     deleteUser,
     toggleUserStatus,
     loading,
-    refresh: () => loadFromBackend(true)
+    refresh: () => {
+      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    }
   };
 }
 
 // 4. ROLES HOOK
 export function useRoles() {
-  const [roles, setRoles] = useLocalState<Role[]>('sicca_roles', DEMO_ROLES);
+  const [roles, setRoles, loading] = useSyncTabState<Role>('Roles', DEMO_ROLES, data => data.filter(r => r.Status !== 'Deleted'));
   const { toast } = useToast();
 
-  const addRole = useCallback((form: any) => {
-    const newRole: Role = {
+  const addRole = useCallback(async (form: any) => {
+    const newRole: Role & { Status?: string } = {
       Role_ID: 'ROL-' + Date.now().toString().slice(-4),
       Name: form.name,
       Description: form.description || '',
       Permissions: JSON.stringify(form.permissions || {}),
-      Created_On: new Date().toLocaleDateString('en-IN')
+      Created_On: new Date().toLocaleDateString('en-IN'),
+      Status: 'Active'
     };
 
-    setRoles(prev => [...prev, newRole]);
-    addSystemLog('CREATE_ROLE', `Role ${newRole.Name} created`);
-    toast({ title: 'Success', description: `Role ${newRole.Name} created.` });
-    return { success: true };
-  }, [setRoles, toast]);
+    try {
+      await updateLocalCache('Roles', newRole, 'Role_ID');
 
-  const updateRole = useCallback((roleId: string, form: any) => {
-    setRoles(prev => prev.map(r => r.Role_ID === roleId ? {
-      ...r,
-      Name: form.name || r.Name,
-      Description: form.description || r.Description,
-      Permissions: JSON.stringify(form.permissions || {})
-    } : r));
-    addSystemLog('UPDATE_ROLE', `Role ID ${roleId} updated`);
-    toast({ title: 'Updated', description: 'Role permissions saved.' });
-    return { success: true };
-  }, [setRoles, toast]);
+      addSystemLog('CREATE_ROLE', `Role ${newRole.Name} created`);
+      toast({ title: 'Success', description: `Role ${newRole.Name} created.` });
 
-  const deleteRole = useCallback((roleId: string) => {
+      // Queue write
+      queueWrite(
+        () => postSheetRow('Roles', newRole),
+        `Add Role ${newRole.Name}`,
+        { type: 'postRow', tabName: 'Roles', rowData: newRole }
+      ).catch(err => console.error("Failed to queue Roles write:", err));
+
+      return { success: true };
+    } catch (err: any) {
+      toast({ title: 'Error', description: 'Failed to add role: ' + err.message, variant: 'destructive' });
+      return { success: false };
+    }
+  }, [toast]);
+
+  const updateRole = useCallback(async (roleId: string, form: any) => {
+    const existing = roles.find(r => r.Role_ID === roleId);
+    const updated: Role & { Status?: string } = {
+      Role_ID: roleId,
+      Name: form.name || existing?.Name || '',
+      Description: form.description || existing?.Description || '',
+      Permissions: JSON.stringify(form.permissions || {}),
+      Created_On: existing?.Created_On || new Date().toLocaleDateString('en-IN'),
+      Status: 'Active'
+    };
+
+    try {
+      await updateLocalCache('Roles', updated, 'Role_ID');
+
+      addSystemLog('UPDATE_ROLE', `Role ID ${roleId} updated`);
+      toast({ title: 'Updated', description: 'Role permissions saved.' });
+
+      // Queue write
+      queueWrite(
+        () => postSheetRow('Roles', updated),
+        `Update Role ID ${roleId}`,
+        { type: 'postRow', tabName: 'Roles', rowData: updated }
+      ).catch(err => console.error("Failed to queue Roles update:", err));
+
+      return { success: true };
+    } catch (err: any) {
+      toast({ title: 'Error', description: 'Failed to update role: ' + err.message, variant: 'destructive' });
+      return { success: false };
+    }
+  }, [roles, toast]);
+
+  const deleteRole = useCallback(async (roleId: string) => {
     const roleToDelete = roles.find(r => r.Role_ID === roleId);
     if (!roleToDelete) return { success: false };
 
-    setRoles(prev => prev.filter(r => r.Role_ID !== roleId));
-    addSystemLog('DELETE_ROLE', `${roleToDelete.Name} role deleted`);
-    toast({ title: 'Deleted', description: `Role "${roleToDelete.Name}" deleted.` });
-    return { success: true };
-  }, [roles, setRoles, toast]);
+    const deleted = { ...roleToDelete, Status: 'Deleted' };
+
+    try {
+      await updateLocalCache('Roles', deleted, 'Role_ID');
+
+      addSystemLog('DELETE_ROLE', `${roleToDelete.Name} role deleted`);
+      toast({ title: 'Deleted', description: `Role "${roleToDelete.Name}" deleted.` });
+
+      // Queue write
+      queueWrite(
+        () => postSheetRow('Roles', deleted),
+        `Delete Role ID ${roleId}`,
+        { type: 'postRow', tabName: 'Roles', rowData: deleted }
+      ).catch(err => console.error("Failed to queue Roles delete:", err));
+
+      return { success: true };
+    } catch (err: any) {
+      toast({ title: 'Error', description: 'Failed to delete role: ' + err.message, variant: 'destructive' });
+      return { success: false };
+    }
+  }, [roles, toast]);
 
   return {
     roles,
     addRole,
     updateRole,
     deleteRole,
-    refresh: () => {}
+    loading,
+    refresh: () => {
+      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    }
   };
 }
 
 // 5. NOTICE BOARD HOOK
 export function useNoticeBoard() {
-  const [notices, setNotices] = useLocalState<Notice[]>('sicca_notices', DEMO_NOTICES);
+  const [notices, setNotices, loading] = useSyncTabState<Notice>('Notice_Board', DEMO_NOTICES, data => [...data].reverse());
   const { toast } = useToast();
-  const [loading, setLoading] = useState(true);
-
-  const loadFromBackend = useCallback(async (isInitial = false) => {
-    if (isInitial) setLoading(true);
-    try {
-      const data = await fetchSheetTab('database', 'Notice_Board');
-      if (data) {
-        setNotices([...data].reverse() as Notice[]);
-      }
-    } catch (err: any) {
-      console.error('Failed to load notices:', err);
-      if (isInitial) {
-        toast({ title: 'Showing demo data — backend unreachable', description: 'Using local fallback data.', variant: 'destructive' });
-      }
-    } finally {
-      if (isInitial) setLoading(false);
-    }
-  }, [setNotices, toast]);
-
-  useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => loadFromBackend(false), delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
 
   const addNotice = useCallback(async (form: any) => {
     const newNotice: Notice = {
@@ -620,171 +814,221 @@ export function useNoticeBoard() {
       Expiry: form.expiry || ''
     };
 
-    setNotices(prev => [newNotice, ...prev]);
-
     try {
+      await updateLocalCache('Notice_Board', newNotice, 'Notice_ID');
+
       const urlStr = process.env.NEXT_PUBLIC_SHEETS_API_URL;
       if (!urlStr) throw new Error('NEXT_PUBLIC_SHEETS_API_URL not configured');
-      const res = await fetch(urlStr, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({
-          action: 'createNotice',
-          title: form.title,
-          content: form.content,
-          priority: form.priority || 'info',
-          expiry: form.expiry || '',
-          taggedUsers: form.taggedUsers || [],
-          token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
-        })
-      });
-      if (!res.ok) throw new Error(`HTTP status ${res.status}`);
-      const json = await res.json();
-      if (!json || json.success === false) {
-        throw new Error(json?.error || 'Failed to post notice');
-      }
+
+      queueWrite(
+        () => fetch(urlStr, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: JSON.stringify({
+            action: 'createNotice',
+            title: form.title,
+            content: form.content,
+            priority: form.priority || 'info',
+            expiry: form.expiry || '',
+            taggedUsers: form.taggedUsers || [],
+            token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+          })
+        }).then(res => res.json()),
+        `Create notice: ${form.title}`
+      ).catch(err => console.error("Failed to queue createNotice:", err));
+
       toast({ title: 'Posted', description: 'Announcement published to board.' });
-      loadFromBackend(false);
       return { success: true };
     } catch (err: any) {
-      console.error('Failed to post notice to backend:', err);
-      toast({ title: 'Notice Posted (Local Only)', description: 'Saved locally, but backend update failed: ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to add notice: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [setNotices, loadFromBackend, toast]);
+  }, [toast]);
 
   const deleteNotice = useCallback(async (noticeId: string) => {
-    setNotices(prev => prev.filter(n => n.Notice_ID !== noticeId));
     try {
+      await filterLocalCache('Notice_Board', n => n.Notice_ID !== noticeId);
+
       const urlStr = process.env.NEXT_PUBLIC_SHEETS_API_URL;
       if (!urlStr) throw new Error('NEXT_PUBLIC_SHEETS_API_URL not configured');
-      const res = await fetch(urlStr, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({
-          action: 'deleteNotice',
-          noticeId,
-          token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
-        })
-      });
-      if (!res.ok) throw new Error(`HTTP status ${res.status}`);
+
+      queueWrite(
+        () => fetch(urlStr, {
+          method: 'POST',
+          headers: { 'Content-Type': 'text/plain' },
+          body: JSON.stringify({
+            action: 'deleteNotice',
+            noticeId,
+            token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+          })
+        }).then(res => res.json()),
+        `Delete notice ID ${noticeId}`
+      ).catch(err => console.error("Failed to queue deleteNotice:", err));
+
       toast({ title: 'Removed', description: 'Notice deleted.' });
-      loadFromBackend(false);
       return { success: true };
     } catch (err: any) {
-      toast({ title: 'Error', description: 'Failed to delete notice from backend: ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to delete notice: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [setNotices, loadFromBackend, toast]);
+  }, [toast]);
 
   return {
     notices,
     addNotice,
     deleteNotice,
     loading,
-    refresh: () => loadFromBackend(true)
+    refresh: () => {
+      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    }
   };
 }
 
 // 6. RECYCLE BIN HOOK
 export function useRecycleBin() {
-  const [recycleBin, setRecycleBin] = useLocalState<RecycleItem[]>('sicca_recycle_bin', DEMO_RECYCLE_BIN);
-  const [entries, setEntries] = useLocalState<Entry[]>('sicca_inventory_entries', DEMO_INVENTORY_ENTRIES);
-  const [users, setUsers] = useLocalState<User[]>('sicca_users', DEMO_USERS);
-  const [vendors, setVendors] = useLocalState<Vendor[]>('sicca_vendors', DEMO_VENDORS);
-  const [itemMaster, setItemMaster] = useLocalState<ItemMaster[]>('sicca_item_master', DEMO_ITEM_MASTER);
-  const [cupboards, setCupboards] = useLocalState<Cupboard[]>('sicca_cupboards', DEMO_CUPBOARDS);
-  const [boxes, setBoxes] = useLocalState<Box[]>('sicca_boxes', DEMO_BOXES);
-  const [placements, setPlacements] = useLocalState<Placement[]>('sicca_placements', DEMO_PLACEMENTS);
+  const [recycleBin, setRecycleBin, loading] = useSyncTabState<RecycleItem>('Recycle_Bin', DEMO_RECYCLE_BIN);
   const { toast } = useToast();
 
-  const restoreItem = useCallback((binId: string) => {
+  const restoreItem = useCallback(async (binId: string) => {
     const item = recycleBin.find(i => i.Bin_ID === binId);
     if (!item) return { success: false };
 
-    // Find the original item backup
-    if (isClient) {
-      if (item.Type === 'Stock Entry') {
-        const backups = getStored<Record<string, any>>('sicca_entry_backups', {});
-        const original = backups[binId];
-        if (original) {
-          setEntries(prev => [original, ...prev]);
-          delete backups[binId];
-          setStored('sicca_entry_backups', backups);
-        }
-      } else if (item.Type === 'User') {
-        const backups = getStored<Record<string, any>>('sicca_user_backups', {});
-        const original = backups[binId];
-        if (original) {
-          const restored = { ...original, Status: original.Status || 'Active' };
-          setUsers(prev => [...prev, restored]);
-          postSheetRow('Users', restored);
-          delete backups[binId];
-          setStored('sicca_user_backups', backups);
-        }
-      } else if (item.Type === 'Vendor') {
-        const backups = getStored<Record<string, any>>('sicca_vendor_backups', {});
-        const original = backups[binId];
-        if (original) {
-          const restored = { ...original, Status: 'Active' };
-          setVendors(prev => [...prev, restored]);
-          postSheetRow('Vendors', restored);
-          delete backups[binId];
-          setStored('sicca_vendor_backups', backups);
-        }
-      } else if (item.Type === 'Item Master') {
-        const backups = getStored<Record<string, any>>('sicca_item_master_backups', {});
-        const original = backups[binId];
-        if (original) {
-          const restored = { ...original, Status: 'Active' };
-          setItemMaster(prev => [...prev, restored]);
-          postSheetRow('Item_Master', restored);
-          delete backups[binId];
-          setStored('sicca_item_master_backups', backups);
-        }
-      } else if (item.Type === 'Cupboard') {
-        const backups = getStored<Record<string, any>>('sicca_cupboard_backups', {});
-        const original = backups[binId];
-        if (original) {
-          setCupboards(prev => [...prev, original]);
-          postSheetRow('Cupboards', { ...original, Status: 'Active' });
-          delete backups[binId];
-          setStored('sicca_cupboard_backups', backups);
-        }
-      } else if (item.Type === 'Box') {
-        const backups = getStored<Record<string, any>>('sicca_box_backups', {});
-        const original = backups[binId];
-        if (original) {
-          setBoxes(prev => [...prev, original]);
-          postSheetRow('Boxes', { ...original, Status: 'Active' });
-          const placementsBackup = backups[binId + '_placements'] || [];
-          for (const p of placementsBackup) {
-            postSheetRow('Placements', p);
-            setPlacements(prev => [...prev.filter(old => old.Placement_ID !== p.Placement_ID), p]);
+    try {
+      // 1. Remove from Recycle_Bin
+      await filterLocalCache('Recycle_Bin', i => i.Bin_ID !== binId);
+
+      // Find original backup and restore
+      if (isClient) {
+        if (item.Type === 'Stock Entry') {
+          const backups = getStored<Record<string, any>>('sicca_entry_backups', {});
+          const original = backups[binId];
+          if (original) {
+            await updateLocalCache('Stock_Register', original, 'Entry_ID');
+            queueWrite(
+              () => postSheetRow('Stock_Register', original),
+              `Restore stock entry ${original.Entry_ID}`,
+              { type: 'postRow', tabName: 'Stock_Register', rowData: original }
+            ).catch(err => console.error("Failed to queue Stock_Register restore:", err));
+            delete backups[binId];
+            setStored('sicca_entry_backups', backups);
           }
-          delete backups[binId];
-          delete backups[binId + '_placements'];
-          setStored('sicca_box_backups', backups);
+        } else if (item.Type === 'User') {
+          const backups = getStored<Record<string, any>>('sicca_user_backups', {});
+          const original = backups[binId];
+          if (original) {
+            const restored = { ...original, Status: original.Status || 'Active' };
+            await updateLocalCache('Users', restored, 'User_ID');
+            queueWrite(
+              () => postSheetRow('Users', restored),
+              `Restore user ${restored.Full_Name}`,
+              { type: 'postRow', tabName: 'Users', rowData: restored }
+            ).catch(err => console.error("Failed to queue Users restore:", err));
+            delete backups[binId];
+            setStored('sicca_user_backups', backups);
+          }
+        } else if (item.Type === 'Vendor') {
+          const backups = getStored<Record<string, any>>('sicca_vendor_backups', {});
+          const original = backups[binId];
+          if (original) {
+            const restored = { ...original, Status: 'Active' };
+            await updateLocalCache('Vendors', restored, 'Vendor_ID');
+            queueWrite(
+              () => postSheetRow('Vendors', restored),
+              `Restore vendor ${restored.Vendor_Name}`,
+              { type: 'postRow', tabName: 'Vendors', rowData: restored }
+            ).catch(err => console.error("Failed to queue Vendors restore:", err));
+            delete backups[binId];
+            setStored('sicca_vendor_backups', backups);
+          }
+        } else if (item.Type === 'Item Master') {
+          const backups = getStored<Record<string, any>>('sicca_item_master_backups', {});
+          const original = backups[binId];
+          if (original) {
+            const restored = { ...original, Status: 'Active' };
+            await updateLocalCache('Item_Master', restored, 'Item_ID');
+            queueWrite(
+              () => postSheetRow('Item_Master', restored),
+              `Restore item ${restored.Item_Name}`,
+              { type: 'postRow', tabName: 'Item_Master', rowData: restored }
+            ).catch(err => console.error("Failed to queue Item_Master restore:", err));
+            delete backups[binId];
+            setStored('sicca_item_master_backups', backups);
+          }
+        } else if (item.Type === 'Cupboard') {
+          const backups = getStored<Record<string, any>>('sicca_cupboard_backups', {});
+          const original = backups[binId];
+          if (original) {
+            const restored = { ...original, Status: 'Active' };
+            await updateLocalCache('Cupboards', restored, 'Cupboard_ID');
+            queueWrite(
+              () => postSheetRow('Cupboards', restored),
+              `Restore cupboard ${restored.Cupboard_Number}`,
+              { type: 'postRow', tabName: 'Cupboards', rowData: restored }
+            ).catch(err => console.error("Failed to queue Cupboards restore:", err));
+            delete backups[binId];
+            setStored('sicca_cupboard_backups', backups);
+          }
+        } else if (item.Type === 'Box') {
+          const backups = getStored<Record<string, any>>('sicca_box_backups', {});
+          const original = backups[binId];
+          if (original) {
+            const restoredBox = { ...original, Status: 'Active' };
+            await updateLocalCache('Boxes', restoredBox, 'Box_ID');
+            queueWrite(
+              () => postSheetRow('Boxes', restoredBox),
+              `Restore box ${restoredBox.Box_Name}`,
+              { type: 'postRow', tabName: 'Boxes', rowData: restoredBox }
+            ).catch(err => console.error("Failed to queue Boxes restore:", err));
+
+            // Restore placements in box
+            const placementsBackup = backups[binId + '_placements'] || [];
+            const cachedPlc = await getCached('Placements');
+            let rawPlc = cachedPlc?.data || [];
+            for (const p of placementsBackup) {
+              rawPlc = updateRawData(rawPlc, p, 'Placement_ID');
+              queueWrite(
+                () => postSheetRow('Placements', p),
+                `Restore placement ${p.Placement_ID} for Box ${restoredBox.Box_Name}`,
+                { type: 'postRow', tabName: 'Placements', rowData: p }
+              ).catch(err => console.error("Failed to queue Placement restore write:", err));
+            }
+            await idbSet('Placements', { data: rawPlc, syncedAt: Date.now() });
+            window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Placements', data: rawPlc } }));
+
+            delete backups[binId];
+            delete backups[binId + '_placements'];
+            setStored('sicca_box_backups', backups);
+          }
         }
       }
-    }
 
-    setRecycleBin(prev => prev.filter(i => i.Bin_ID !== binId));
-    toast({ title: 'Restored', description: `${item.Item_Name} restored.` });
-    return { success: true };
-  }, [recycleBin, setRecycleBin, setEntries, setUsers, setVendors, setItemMaster, setCupboards, setBoxes, setPlacements, toast]);
-
-  const emptyBin = useCallback(() => {
-    setRecycleBin([]);
-    if (isClient) {
-      setStored('sicca_entry_backups', {});
-      setStored('sicca_user_backups', {});
-      setStored('sicca_vendor_backups', {});
-      setStored('sicca_item_master_backups', {});
+      toast({ title: 'Restored', description: `${item.Item_Name} restored.` });
+      return { success: true };
+    } catch (err: any) {
+      toast({ title: 'Error', description: 'Failed to restore item: ' + err.message, variant: 'destructive' });
+      return { success: false };
     }
-    toast({ title: 'Recovery Vault Emptied', description: 'All items deleted permanently.' });
-    return { success: true };
-  }, [setRecycleBin, toast]);
+  }, [recycleBin, toast]);
+
+  const emptyBin = useCallback(async () => {
+    try {
+      await idbSet('Recycle_Bin', { data: [], syncedAt: Date.now() });
+      window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Recycle_Bin', data: [] } }));
+
+      if (isClient) {
+        setStored('sicca_entry_backups', {});
+        setStored('sicca_user_backups', {});
+        setStored('sicca_vendor_backups', {});
+        setStored('sicca_item_master_backups', {});
+        setStored('sicca_box_backups', {});
+      }
+      toast({ title: 'Recovery Vault Emptied', description: 'All items deleted permanently.' });
+      return { success: true };
+    } catch (err: any) {
+      toast({ title: 'Error', description: 'Failed to empty bin: ' + err.message, variant: 'destructive' });
+      return { success: false };
+    }
+  }, [toast]);
 
   return {
     items: recycleBin,
@@ -796,7 +1040,7 @@ export function useRecycleBin() {
 
 // 7. ACTIVITY LOG HOOK
 export function useActivityLog() {
-  const [logs] = useLocalState<ActivityLog[]>('sicca_activity_log', DEMO_ACTIVITY_LOG);
+  const [logs, , loading] = useSyncTabState<ActivityLog>('Activity_Log', DEMO_ACTIVITY_LOG);
   return {
     logs,
     refresh: () => {}
@@ -805,34 +1049,8 @@ export function useActivityLog() {
 
 // 8. VENDORS HOOK
 export function useVendors() {
-  const [vendors, setVendors] = useLocalState<Vendor[]>('sicca_vendors', DEMO_VENDORS);
-  const [recycleBin, setRecycleBin] = useLocalState<RecycleItem[]>('sicca_recycle_bin', DEMO_RECYCLE_BIN);
+  const [vendors, setVendors, loading] = useSyncTabState<Vendor>('Vendors', DEMO_VENDORS, data => data.filter(v => v.Status !== 'Deleted'));
   const { toast } = useToast();
-  const [loading, setLoading] = useState(true);
-
-  const loadFromBackend = useCallback(async (isInitial = false) => {
-    if (isInitial) setLoading(true);
-    try {
-      const raw = await fetchSheetTab('database', 'Vendors');
-      const vendorMap = new Map<string, Vendor>();
-      raw.forEach((v: any) => { if (v.Vendor_ID) vendorMap.set(v.Vendor_ID, v); });
-      setVendors(Array.from(vendorMap.values()).filter((v: any) => v.Status !== 'Deleted'));
-    } catch (err: any) {
-      console.error('Failed to load vendors:', err);
-      if (isInitial) {
-        toast({ title: 'Showing demo data — backend unreachable', description: 'Using local fallback data.', variant: 'destructive' });
-      }
-    } finally {
-      if (isInitial) setLoading(false);
-    }
-  }, [setVendors, toast]);
-
-  useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => loadFromBackend(false), delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
 
   const addVendor = useCallback(async (form: any) => {
     const maxNum = vendors.reduce((max, v) => {
@@ -849,16 +1067,24 @@ export function useVendors() {
     };
 
     try {
-      await postSheetRow('Vendors', newVendor);
-      setVendors(prev => [...prev, newVendor as any]);
+      await updateLocalCache('Vendors', newVendor, 'Vendor_ID');
+
       addSystemLog('CREATE_VENDOR', `Vendor "${newVendor.Vendor_Name}" added`);
       toast({ title: 'Success', description: `Vendor ${newVendor.Vendor_Name} added.` });
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Vendors', newVendor),
+        `Add vendor "${newVendor.Vendor_Name}" (ID: ${id})`,
+        { type: 'postRow', tabName: 'Vendors', rowData: newVendor }
+      ).catch(err => console.error("Failed to queue Vendors write:", err));
+
       return { success: true, vendorId: id };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to write to Google Sheets. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to update local state: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [vendors, setVendors, toast]);
+  }, [vendors, toast]);
 
   const updateVendor = useCallback(async (vendorId: string, form: any) => {
     const existing: any = vendors.find(v => v.Vendor_ID === vendorId);
@@ -877,18 +1103,26 @@ export function useVendors() {
     };
 
     try {
-      await postSheetRow('Vendors', updated);
-      setVendors(prev => prev.map(v => v.Vendor_ID === vendorId ? { ...v, ...updated } as any : v));
+      await updateLocalCache('Vendors', updated, 'Vendor_ID');
+
       addSystemLog('UPDATE_VENDOR', `Vendor ID ${vendorId} updated`);
       toast({ title: 'Updated', description: 'Vendor details updated.' });
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Vendors', updated),
+        `Update vendor ID ${vendorId}`,
+        { type: 'postRow', tabName: 'Vendors', rowData: updated }
+      ).catch(err => console.error("Failed to queue Vendors update:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to update Google Sheets. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to update local state: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [vendors, setVendors, toast]);
+  }, [vendors, toast]);
 
-  const deleteVendor = useCallback((vendorId: string) => {
+  const deleteVendor = useCallback(async (vendorId: string) => {
     const vendorToDelete = vendors.find(v => v.Vendor_ID === vendorId);
     if (!vendorToDelete) return { success: false };
 
@@ -900,19 +1134,35 @@ export function useVendors() {
       Deleted_By: 'Admin',
       Date_Time: new Date().toLocaleString()
     };
-    setRecycleBin(prev => [newBinItem, ...prev]);
-    setVendors(prev => prev.filter(v => v.Vendor_ID !== vendorId));
 
-    if (isClient) {
-      const backups = getStored<Record<string, any>>('sicca_vendor_backups', {});
-      backups[newBinItem.Bin_ID] = vendorToDelete;
-      setStored('sicca_vendor_backups', backups);
+    const deleted: Record<string, any> = { ...vendorToDelete, Status: 'Deleted' };
+
+    try {
+      await updateLocalCache('Vendors', deleted, 'Vendor_ID');
+      await updateLocalCache('Recycle_Bin', newBinItem, 'Bin_ID');
+
+      if (isClient) {
+        const backups = getStored<Record<string, any>>('sicca_vendor_backups', {});
+        backups[newBinItem.Bin_ID] = vendorToDelete;
+        setStored('sicca_vendor_backups', backups);
+      }
+
+      addSystemLog('DELETE_VENDOR', `Vendor "${vendorToDelete.Vendor_Name}" deleted`);
+      toast({ title: 'Deleted', description: 'Vendor moved to Recovery Vault.' });
+
+      // Queue soft delete
+      queueWrite(
+        () => postSheetRow('Vendors', deleted),
+        `Delete vendor ID ${vendorId}`,
+        { type: 'postRow', tabName: 'Vendors', rowData: deleted }
+      ).catch(err => console.error("Failed to queue Vendors delete:", err));
+
+      return { success: true };
+    } catch (err: any) {
+      toast({ title: 'Error', description: 'Failed to delete vendor: ' + err.message, variant: 'destructive' });
+      return { success: false };
     }
-
-    addSystemLog('DELETE_VENDOR', `Vendor "${vendorToDelete.Vendor_Name}" deleted`);
-    toast({ title: 'Deleted', description: 'Vendor moved to Recovery Vault.' });
-    return { success: true };
-  }, [vendors, setVendors, setRecycleBin, toast]);
+  }, [vendors, toast]);
 
   return {
     vendors,
@@ -920,55 +1170,37 @@ export function useVendors() {
     updateVendor,
     deleteVendor,
     loading,
-    refresh: () => loadFromBackend(true)
+    refresh: () => {
+      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    }
   };
 }
 
 // 9. ITEM MASTER HOOK
 export function useItemMaster() {
-  const [items, setItems] = useLocalState<ItemMaster[]>('sicca_item_master', DEMO_ITEM_MASTER);
-  const [pendingItems, setPendingItems] = useLocalState<ItemMaster[]>('sicca_pending_items', []);
+  const [rawItems, setRawItems, loading] = useSyncTabState<ItemMaster>('Item_Master', DEMO_ITEM_MASTER);
   const { toast } = useToast();
-  const [loading, setLoading] = useState(true);
 
-  const loadFromBackend = useCallback(async (isInitial = false) => {
-    if (isInitial) setLoading(true);
-    try {
-      const data = await fetchSheetTab('database', 'Item_Master');
-      
-      // Deduplicate: take the latest entry by Item_ID
-      const itemMap = new Map<string, ItemMaster>();
-      data.forEach((i: any) => {
-        if (i.Item_ID) {
-          itemMap.set(i.Item_ID, i);
-        }
-      });
-      const activeItems = Array.from(itemMap.values()).filter(i => i.Status !== 'Deleted' && i.Status !== 'Pending Review');
-      const pItems = Array.from(itemMap.values()).filter(i => i.Status === 'Pending Review');
-      setItems(activeItems);
-      setPendingItems(pItems);
-    } catch (err: any) {
-      console.error('Failed to fetch Item_Master from backend:', err);
-      if (isInitial) {
-        toast({
-          title: 'Showing demo data — backend unreachable',
-          description: 'Using local fallback data.',
-          variant: 'destructive'
-        });
+  const items = useMemo(() => {
+    // Deduplicate: take the latest entry by Item_ID
+    const itemMap = new Map<string, ItemMaster>();
+    rawItems.forEach((i: any) => {
+      if (i.Item_ID) {
+        itemMap.set(i.Item_ID, i);
       }
-    } finally {
-      if (isInitial) setLoading(false);
-    }
-  }, [setItems, setPendingItems, toast]);
+    });
+    return Array.from(itemMap.values()).filter(i => i.Status !== 'Deleted' && i.Status !== 'Pending Review');
+  }, [rawItems]);
 
-  useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => {
-      loadFromBackend(false);
-    }, delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
+  const pendingItems = useMemo(() => {
+    const itemMap = new Map<string, ItemMaster>();
+    rawItems.forEach((i: any) => {
+      if (i.Item_ID) {
+        itemMap.set(i.Item_ID, i);
+      }
+    });
+    return Array.from(itemMap.values()).filter(i => i.Status === 'Pending Review');
+  }, [rawItems]);
 
   const addItem = useCallback(async (form: any) => {
     const maxNum = items.reduce((max, i) => {
@@ -999,26 +1231,25 @@ export function useItemMaster() {
     };
 
     try {
-      await postSheetRow('Item_Master', newItem);
-      
-      // Optimistic update
-      if (newItem.Status === 'Pending Review') {
-        setPendingItems(prev => [...prev, newItem as any]);
-      } else {
-        setItems(prev => [...prev, newItem as any]);
-      }
+      await updateLocalCache('Item_Master', newItem, 'Item_ID');
+
       addSystemLog('CREATE_ITEM_MASTER', `Item "${form.itemName}" catalogued (Status: ${newItem.Status})`);
       toast({ title: 'Success', description: `Item "${form.itemName}" catalogued.` });
+
+      // Queue network write
+      const description = `Add item "${form.itemName}" (ID: ${id})`;
+      queueWrite(
+        () => postSheetRow('Item_Master', newItem),
+        description,
+        { type: 'postRow', tabName: 'Item_Master', rowData: newItem }
+      ).catch(err => console.error("Failed to queue Item_Master write:", err));
+
       return { success: true, itemId: id, itemCode: newItem.Item_Code as string };
     } catch (err: any) {
-      toast({
-        title: 'Network Error',
-        description: 'Failed to write to Google Sheets. ' + err.message,
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: 'Failed to update local state: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [setItems, setPendingItems, toast]);
+  }, [items, toast]);
 
   const updateItem = useCallback(async (itemId: string, form: any) => {
     const existing = items.find(i => i.Item_ID === itemId);
@@ -1041,22 +1272,25 @@ export function useItemMaster() {
     };
 
     try {
-      await postSheetRow('Item_Master', updatedItem);
-      
-      // Optimistic update
-      setItems(prev => prev.map(i => i.Item_ID === itemId ? updatedItem as any : i));
+      await updateLocalCache('Item_Master', updatedItem, 'Item_ID');
+
       addSystemLog('UPDATE_ITEM_MASTER', `Item ID ${itemId} updated`);
       toast({ title: 'Updated', description: 'Item master catalog updated.' });
+
+      // Queue network write
+      const description = `Update item ID ${itemId}`;
+      queueWrite(
+        () => postSheetRow('Item_Master', updatedItem),
+        description,
+        { type: 'postRow', tabName: 'Item_Master', rowData: updatedItem }
+      ).catch(err => console.error("Failed to queue Item_Master update:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({
-        title: 'Network Error',
-        description: 'Failed to update Google Sheets. ' + err.message,
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: 'Failed to update local state: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [items, setItems, toast]);
+  }, [items, toast]);
 
   const deleteItem = useCallback(async (itemId: string) => {
     const existing = items.find(i => i.Item_ID === itemId);
@@ -1081,91 +1315,123 @@ export function useItemMaster() {
     };
 
     try {
-      await postSheetRow('Item_Master', deletedItem);
-      
-      // Optimistic update
-      setItems(prev => prev.filter(i => i.Item_ID !== itemId));
-      setPendingItems(prev => prev.filter(i => i.Item_ID !== itemId));
+      await updateLocalCache('Item_Master', deletedItem, 'Item_ID');
+
       addSystemLog('DELETE_ITEM_MASTER', `Item "${existing.Item_Name}" deleted`);
       toast({ title: 'Deleted', description: 'Item removed from catalogue.' });
+
+      // Queue network write
+      const description = `Delete item ID ${itemId}`;
+      queueWrite(
+        () => postSheetRow('Item_Master', deletedItem),
+        description,
+        { type: 'postRow', tabName: 'Item_Master', rowData: deletedItem }
+      ).catch(err => console.error("Failed to queue Item_Master delete:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({
-        title: 'Network Error',
-        description: 'Failed to delete item from Google Sheets. ' + err.message,
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: 'Failed to delete item: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [items, setItems, setPendingItems, toast]);
+  }, [items, toast]);
 
   const approveItem = useCallback(async (itemId: string) => {
     const item = items.find(i => i.Item_ID === itemId) || (pendingItems.find(p => p.Item_ID === itemId));
     if (!item) return { success: false, error: 'Item not found' };
     const updated: ItemMaster = { ...item, Status: 'Active', Last_Updated: new Date().toLocaleString() };
     try {
-      await postSheetRow('Item_Master', updated);
-      setItems(prev => [...prev.filter(i => i.Item_ID !== itemId), updated]);
-      setPendingItems(prev => prev.filter(p => p.Item_ID !== itemId));
+      await updateLocalCache('Item_Master', updated, 'Item_ID');
+
       addSystemLog('APPROVE_ITEM', `Pending item "${item.Item_Name}" approved`);
       toast({ title: 'Approved', description: `Item "${item.Item_Name}" approved and added to catalog.` });
+
+      // Queue network write
+      const description = `Approve item ID ${itemId}`;
+      queueWrite(
+        () => postSheetRow('Item_Master', updated),
+        description,
+        { type: 'postRow', tabName: 'Item_Master', rowData: updated }
+      ).catch(err => console.error("Failed to queue Item_Master approval:", err));
+
       return { success: true };
     } catch (err: any) {
       toast({ title: 'Error', description: 'Failed to approve item: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [items, pendingItems, setItems, setPendingItems, toast]);
+  }, [items, pendingItems, toast]);
 
   const rejectItem = useCallback(async (itemId: string, mapToItemCode?: string) => {
     const item = items.find(i => i.Item_ID === itemId) || (pendingItems.find(p => p.Item_ID === itemId));
     if (!item) return { success: false, error: 'Item not found' };
     const updated: ItemMaster = { ...item, Status: 'Deleted', Last_Updated: new Date().toLocaleString() };
+    
     try {
-      await postSheetRow('Item_Master', updated);
-      setPendingItems(prev => prev.filter(p => p.Item_ID !== itemId));
-      setItems(prev => prev.filter(i => i.Item_ID !== itemId));
+      await updateLocalCache('Item_Master', updated, 'Item_ID');
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Item_Master', updated),
+        `Reject item ID ${itemId}`,
+        { type: 'postRow', tabName: 'Item_Master', rowData: updated }
+      ).catch(err => console.error("Failed to queue Item_Master reject:", err));
 
       if (mapToItemCode) {
-        // Fetch fresh entries and placements directly from database
-        const rawEntries = await fetchSheetTab('database', 'Stock_Register');
-        const rawPlacements = await fetchSheetTab('database', 'Placements');
-        
-        // Find existing item details
         const existingItem = items.find(i => i.Item_Code === mapToItemCode);
         if (existingItem) {
           // 1. Update entries in Stock_Register
+          const cachedEntries = await getCached('Stock_Register');
+          const rawEntries = cachedEntries?.data || [];
           const matchingEntries = rawEntries.filter((e: any) => e.Item_Code === item.Item_Code);
+          let nextEntries = [...rawEntries];
           for (const entry of matchingEntries) {
             const updatedEntry = {
               ...entry,
               Item_Code: existingItem.Item_Code,
               Item_Name: existingItem.Item_Name
             };
-            await postSheetRow('Stock_Register', updatedEntry);
+            nextEntries = updateRawData(nextEntries, updatedEntry, 'Entry_ID');
+            queueWrite(
+              () => postSheetRow('Stock_Register', updatedEntry),
+              `Map Stock_Register entry ${entry.Entry_ID} to ${existingItem.Item_Code}`,
+              { type: 'postRow', tabName: 'Stock_Register', rowData: updatedEntry }
+            ).catch(err => console.error("Failed to queue Stock_Register mapping write:", err));
           }
+          await idbSet('Stock_Register', { data: nextEntries, syncedAt: Date.now() });
+          window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Stock_Register', data: nextEntries } }));
+
           // 2. Update placements in Placements
+          const cachedPlacements = await getCached('Placements');
+          const rawPlacements = cachedPlacements?.data || [];
           const matchingPlacements = rawPlacements.filter((p: any) => p.Item_Code === item.Item_Code);
+          let nextPlacements = [...rawPlacements];
           for (const plc of matchingPlacements) {
             const updatedPlc = {
               ...plc,
               Item_Code: existingItem.Item_Code
             };
-            await postSheetRow('Placements', updatedPlc);
+            nextPlacements = updateRawData(nextPlacements, updatedPlc, 'Placement_ID');
+            queueWrite(
+              () => postSheetRow('Placements', updatedPlc),
+              `Map Placement ${plc.Placement_ID} to ${existingItem.Item_Code}`,
+              { type: 'postRow', tabName: 'Placements', rowData: updatedPlc }
+            ).catch(err => console.error("Failed to queue Placements mapping write:", err));
           }
-          
+          await idbSet('Placements', { data: nextPlacements, syncedAt: Date.now() });
+          window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Placements', data: nextPlacements } }));
+
           toast({ title: 'Mapped', description: `Pending item mapped to "${existingItem.Item_Name}".` });
         }
       } else {
         toast({ title: 'Rejected', description: `Pending item "${item.Item_Name}" rejected and discarded.` });
       }
-      
+
       addSystemLog('REJECT_ITEM', `Pending item "${item.Item_Name}" rejected`);
       return { success: true };
     } catch (err: any) {
       toast({ title: 'Error', description: 'Failed to reject/map item: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [items, pendingItems, setItems, setPendingItems, toast]);
+  }, [items, pendingItems, toast]);
 
   return {
     items,
@@ -1176,122 +1442,146 @@ export function useItemMaster() {
     approveItem,
     rejectItem,
     loading,
-    refresh: () => loadFromBackend(true)
+    refresh: () => {
+      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    }
   };
 }
 
-export function useCupboards() {
-  const [cupboards, setCupboards] = useLocalState<Cupboard[]>('sicca_cupboards', DEMO_CUPBOARDS);
-  const [cupboardItems, setCupboardItems] = useLocalState<CupItem[]>('sicca_cupboard_items', DEMO_CUPBOARD_ITEMS);
-  const { toast } = useToast();
-  const [loading, setLoading] = useState(true);
-  const [recycleBin, setRecycleBin] = useLocalState<RecycleItem[]>('sicca_recycle_bin', DEMO_RECYCLE_BIN);
+function processCupboardsAndItems(
+  rawCups: any[] = [],
+  rawCupboardItems: any[] = [],
+  rawCatalog: any[] = [],
+  rawEntries: any[] = []
+) {
+  const activeCups = rawCups.filter(c => c.Cupboard_ID && c.Status !== 'Deleted');
+  const activeCatalog = rawCatalog.filter(i => i.Item_ID && i.Status !== 'Deleted');
+  const activeItems = rawCupboardItems.filter(i => i.Item_ID && i.Status !== 'Deleted');
 
-  const loadFromBackend = useCallback(async (isInitial = false) => {
+  const enrichedItems: CupItem[] = activeItems.map(item => {
+    const matchedItem = activeCatalog.find(
+      c => c.Item_Code === item.Item_Code || c.Item_ID === item.Item_Code
+    );
+    const liveQty = rawEntries.reduce((acc: number, entry: any) => {
+      if (
+        entry.Item_Code &&
+        safeStr(entry.Item_Code).toLowerCase() === safeStr(item.Item_Code).toLowerCase()
+      ) {
+        const inQty = parseFloat(entry.Inward_Qty || '0');
+        const outQty = parseFloat(entry.Outward_Qty || '0');
+        return acc + (inQty - outQty);
+      }
+      return acc;
+    }, 0);
+
+    return {
+      ...item,
+      Item_Name: matchedItem ? matchedItem.Item_Name : 'Unknown Item',
+      Category: matchedItem ? matchedItem.Category : 'Uncategorized',
+      Unit: matchedItem ? matchedItem.Unit : 'pcs',
+      Quantity: String(liveQty)
+    };
+  });
+
+  const enrichedCups = activeCups.map(c => {
+    const cItems = enrichedItems.filter(i => i.Cupboard_ID === c.Cupboard_ID);
+    const qty = cItems.reduce((acc, curr) => acc + parseFloat(curr.Quantity || '0'), 0);
+    const low = cItems.filter(curr => {
+      const q = parseFloat(curr.Quantity || '0');
+      const m = parseFloat(curr.Min_Qty || '0');
+      return q <= m && q > 0;
+    }).length;
+    return {
+      ...c,
+      _itemCount: cItems.length,
+      _totalQty: qty,
+      _lowStock: low
+    };
+  });
+
+  return { enrichedCups, enrichedItems };
+}
+
+// 10a. CUPBOARDS HOOK
+export function useCupboards() {
+  const [cupboards, setCupboards] = useState<Cupboard[]>([]);
+  const [cupboardItems, setCupboardItems] = useState<CupItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const { toast } = useToast();
+
+  const loadAll = useCallback(async (isInitial = false) => {
     if (isInitial) setLoading(true);
     try {
-      const rawCups = await fetchSheetTab('database', 'Cupboards');
-      const rawItems = await fetchSheetTab('database', 'Cupboard_Items');
-      const rawCatalog = await fetchSheetTab('database', 'Item_Master');
-      const rawEntries = await fetchSheetTab('database', 'Stock_Register');
+      const [c1, c2, c3, c4] = await Promise.all([
+        getCached('Cupboards'),
+        getCached('Cupboard_Items'),
+        getCached('Item_Master'),
+        getCached('Stock_Register')
+      ]);
+      
+      let rawCups = c1?.data;
+      let rawItems = c2?.data;
+      let rawCatalog = c3?.data;
+      let rawEntries = c4?.data;
 
-      // 1. Deduplicate cupboards: take the latest entry by Cupboard_ID
-      const cupMap = new Map<string, Cupboard>();
-      rawCups.forEach((c: any) => {
-        if (c.Cupboard_ID) {
-          cupMap.set(c.Cupboard_ID, c);
-        }
-      });
-      const activeCups = Array.from(cupMap.values()).filter(c => c.Status !== 'Deleted');
+      if (!rawCups || !rawItems || !rawCatalog || !rawEntries) {
+        const [r1, r2, r3, r4] = await Promise.all([
+          fetchSheetTab('database', 'Cupboards'),
+          fetchSheetTab('database', 'Cupboard_Items'),
+          fetchSheetTab('database', 'Item_Master'),
+          fetchSheetTab('database', 'Stock_Register')
+        ]);
+        rawCups = r1;
+        rawItems = r2;
+        rawCatalog = r3;
+        rawEntries = r4;
+        await Promise.all([
+          idbSet('Cupboards', { data: r1, syncedAt: Date.now() }),
+          idbSet('Cupboard_Items', { data: r2, syncedAt: Date.now() }),
+          idbSet('Item_Master', { data: r3, syncedAt: Date.now() }),
+          idbSet('Stock_Register', { data: r4, syncedAt: Date.now() })
+        ]);
+      }
 
-      // 2. Deduplicate catalog items: take the latest entry by Item_ID / Item_Code
-      const catalogMap = new Map<string, ItemMaster>();
-      rawCatalog.forEach((i: any) => {
-        if (i.Item_ID) {
-          catalogMap.set(i.Item_ID, i);
-        }
-      });
-      const activeCatalog = Array.from(catalogMap.values()).filter(i => i.Status !== 'Deleted');
-
-      // 3. Deduplicate cupboard items: take the latest entry by Item_ID
-      const itemMap = new Map<string, CupItem>();
-      rawItems.forEach((i: any) => {
-        if (i.Item_ID) {
-          itemMap.set(i.Item_ID, i);
-        }
-      });
-      const activeItems = Array.from(itemMap.values()).filter(i => (i as any).Status !== 'Deleted');
-
-      // 4. Enrich Cupboard_Items with Item_Master information and Stock_Register live quantities
-      const enrichedItems: CupItem[] = activeItems.map(item => {
-        // Find by Item_Code or Item_ID
-        const matchedItem = activeCatalog.find(
-          c => c.Item_Code === item.Item_Code || c.Item_ID === item.Item_Code
-        );
-
-        // Sum live quantity (Inward_Qty - Outward_Qty) for this Item_Code in Stock_Register
-        const liveQty = rawEntries.reduce((acc: number, entry: any) => {
-          if (
-            entry.Item_Code &&
-            safeStr(entry.Item_Code).toLowerCase() === safeStr(item.Item_Code).toLowerCase()
-          ) {
-            const inQty = parseFloat(entry.Inward_Qty || '0');
-            const outQty = parseFloat(entry.Outward_Qty || '0');
-            return acc + (inQty - outQty);
-          }
-          return acc;
-        }, 0);
-
-        return {
-          ...item,
-          Item_Name: matchedItem ? matchedItem.Item_Name : 'Unknown Item',
-          Category: matchedItem ? matchedItem.Category : 'Uncategorized',
-          Unit: matchedItem ? matchedItem.Unit : 'pcs',
-          Quantity: String(liveQty)
-        };
-      });
-
-      // 5. Dynamically calculate cupboards aggregates
-      const enrichedCups = activeCups.map(c => {
-        const cItems = enrichedItems.filter(i => i.Cupboard_ID === c.Cupboard_ID);
-        const qty = cItems.reduce((acc, curr) => acc + parseFloat(curr.Quantity || '0'), 0);
-        const low = cItems.filter(curr => {
-          const q = parseFloat(curr.Quantity || '0');
-          const m = parseFloat(curr.Min_Qty || '0');
-          return q <= m && q > 0;
-        }).length;
-        return {
-          ...c,
-          _itemCount: cItems.length,
-          _totalQty: qty,
-          _lowStock: low
-        };
-      });
-
+      const { enrichedCups, enrichedItems } = processCupboardsAndItems(
+        rawCups, rawItems, rawCatalog, rawEntries
+      );
       setCupboards(enrichedCups);
       setCupboardItems(enrichedItems);
-    } catch (err: any) {
-      console.error('Failed to load cupboards/items from backend:', err);
-      if (isInitial) {
-        toast({
-          title: 'Showing demo data — backend unreachable',
-          description: 'Using local fallback data.',
-          variant: 'destructive'
-        });
-      }
+    } catch (err) {
+      console.error('Failed to load cupboards:', err);
+      const { enrichedCups, enrichedItems } = processCupboardsAndItems(
+        DEMO_CUPBOARDS, DEMO_CUPBOARD_ITEMS, DEMO_ITEM_MASTER, DEMO_INVENTORY_ENTRIES
+      );
+      setCupboards(enrichedCups);
+      setCupboardItems(enrichedItems);
     } finally {
-      if (isInitial) setLoading(false);
+      setLoading(false);
     }
-  }, [setCupboards, setCupboardItems, toast]);
+  }, []);
 
   useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => {
-      loadFromBackend(false);
-    }, delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
+    loadAll(true);
+
+    const unsub = subscribeSync((tab) => {
+      if (['Cupboards', 'Cupboard_Items', 'Item_Master', 'Stock_Register'].includes(tab || '')) {
+        loadAll(false);
+      }
+    });
+
+    const handleCustom = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (['Cupboards', 'Cupboard_Items', 'Item_Master', 'Stock_Register'].includes(detail.tab || '')) {
+        loadAll(false);
+      }
+    };
+    window.addEventListener('sync-tab-updated', handleCustom);
+
+    return () => {
+      unsub();
+      window.removeEventListener('sync-tab-updated', handleCustom);
+    };
+  }, [loadAll]);
 
   const addCupboard = useCallback(async (form: any) => {
     const maxNum = cupboards.reduce((max, c) => {
@@ -1317,30 +1607,24 @@ export function useCupboards() {
     };
 
     try {
-      await postSheetRow('Cupboards', newCup);
-      
-      // Optimistic update
-      setCupboards(prev => {
-        const nextCup = {
-          ...newCup,
-          _itemCount: 0,
-          _totalQty: 0,
-          _lowStock: 0
-        } as any;
-        return [...prev, nextCup];
-      });
+      await updateLocalCache('Cupboards', newCup, 'Cupboard_ID');
+
       addSystemLog('CREATE_CUPBOARD', `Cupboard ${form.number} created`);
       toast({ title: 'Success', description: `Cupboard ${form.number} added.` });
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Cupboards', newCup),
+        `Add cupboard ${form.number}`,
+        { type: 'postRow', tabName: 'Cupboards', rowData: newCup }
+      ).catch(err => console.error("Failed to queue Cupboards write:", err));
+
       return { success: true, cupboardId: id };
     } catch (err: any) {
-      toast({
-        title: 'Network Error',
-        description: 'Failed to write to Google Sheets. ' + err.message,
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: 'Failed to add cupboard: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [cupboards, setCupboards, toast]);
+  }, [cupboards, toast]);
 
   const updateCupboard = useCallback(async (cupboardId: string, form: any) => {
     const existing = cupboards.find(c => c.Cupboard_ID === cupboardId);
@@ -1358,22 +1642,24 @@ export function useCupboards() {
     };
 
     try {
-      await postSheetRow('Cupboards', updatedCup);
+      await updateLocalCache('Cupboards', updatedCup, 'Cupboard_ID');
 
-      // Optimistic update
-      setCupboards(prev => prev.map(c => c.Cupboard_ID === cupboardId ? { ...c, ...updatedCup } as any : c));
       addSystemLog('UPDATE_CUPBOARD', `Cupboard ID ${cupboardId} updated`);
       toast({ title: 'Updated', description: 'Cupboard configuration saved.' });
+
+      // Queue write
+      queueWrite(
+        () => postSheetRow('Cupboards', updatedCup),
+        `Update cupboard ID ${cupboardId}`,
+        { type: 'postRow', tabName: 'Cupboards', rowData: updatedCup }
+      ).catch(err => console.error("Failed to queue Cupboards update:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({
-        title: 'Network Error',
-        description: 'Failed to update Google Sheets. ' + err.message,
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: 'Failed to update cupboard: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [cupboards, setCupboards, toast]);
+  }, [cupboards, toast]);
 
   const deleteCupboard = useCallback(async (cupboardId: string) => {
     const existing = cupboards.find(c => c.Cupboard_ID === cupboardId);
@@ -1392,8 +1678,27 @@ export function useCupboards() {
     };
 
     try {
-      await postSheetRow('Cupboards', deletedCup);
+      await updateLocalCache('Cupboards', deletedCup, 'Cupboard_ID');
 
+      // Update cupboard items status to Deleted
+      const cachedItems = await getCached('Cupboard_Items');
+      const rawItems = cachedItems?.data || [];
+      let nextItems = [...rawItems];
+      for (const item of rawItems) {
+        if (item.Cupboard_ID === cupboardId) {
+          const deletedItem = { ...item, Status: 'Deleted' };
+          nextItems = updateRawData(nextItems, deletedItem, 'Item_ID');
+          queueWrite(
+            () => postSheetRow('Cupboard_Items', deletedItem),
+            `Delete Cupboard Item ID ${item.Item_ID} due to cupboard deletion`,
+            { type: 'postRow', tabName: 'Cupboard_Items', rowData: deletedItem }
+          ).catch(err => console.error("Failed to queue Cupboard Item delete:", err));
+        }
+      }
+      await idbSet('Cupboard_Items', { data: nextItems, syncedAt: Date.now() });
+      window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Cupboard_Items', data: nextItems } }));
+
+      // Add to Recycle Bin
       const newBinItem: RecycleItem = {
         Bin_ID: 'BIN-' + Date.now(),
         Original_ID: existing.Cupboard_ID,
@@ -1402,7 +1707,7 @@ export function useCupboards() {
         Deleted_By: 'Admin',
         Date_Time: new Date().toLocaleString()
       };
-      setRecycleBin(prev => [newBinItem, ...prev]);
+      await updateLocalCache('Recycle_Bin', newBinItem, 'Bin_ID');
 
       if (isClient) {
         const backups = getStored<Record<string, any>>('sicca_cupboard_backups', {});
@@ -1410,21 +1715,22 @@ export function useCupboards() {
         setStored('sicca_cupboard_backups', backups);
       }
 
-      // Optimistic update: filter out the deleted cupboard and its items
-      setCupboards(prev => prev.filter(c => c.Cupboard_ID !== cupboardId));
-      setCupboardItems(prev => prev.filter(i => i.Cupboard_ID !== cupboardId));
       addSystemLog('DELETE_CUPBOARD', `Cupboard "${existing.Name}" deleted`);
       toast({ title: 'Deleted', description: 'Container moved to Recovery Vault.' });
+
+      // Queue Cupboard delete write
+      queueWrite(
+        () => postSheetRow('Cupboards', deletedCup),
+        `Delete cupboard "${existing.Name}" (ID: ${cupboardId})`,
+        { type: 'postRow', tabName: 'Cupboards', rowData: deletedCup }
+      ).catch(err => console.error("Failed to queue Cupboards delete:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({
-        title: 'Network Error',
-        description: 'Failed to delete cupboard on Google Sheets. ' + err.message,
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: 'Failed to delete cupboard: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [cupboards, setCupboards, setCupboardItems, setRecycleBin, toast]);
+  }, [cupboards, toast]);
 
   const getCupboardItems = useCallback((cupboardId: string) => {
     return cupboardItems.filter(item => item.Cupboard_ID === cupboardId);
@@ -1453,21 +1759,22 @@ export function useCupboards() {
     };
 
     try {
-      await postSheetRow('Cupboard_Items', newItem);
-      
-      await loadFromBackend(false);
-      
+      await updateLocalCache('Cupboard_Items', newItem, 'Item_ID');
       toast({ title: 'Added', description: `Item added to cupboard.` });
+
+      // Queue write
+      queueWrite(
+        () => postSheetRow('Cupboard_Items', newItem),
+        `Add Cupboard Item ${form.itemCode} to Cupboard ${form.cupboardId}`,
+        { type: 'postRow', tabName: 'Cupboard_Items', rowData: newItem }
+      ).catch(err => console.error("Failed to queue Cupboard Item write:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({
-        title: 'Network Error',
-        description: 'Failed to add item to Google Sheets. ' + err.message,
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: 'Failed to add item to cupboard: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [cupboardItems, loadFromBackend, toast]);
+  }, [cupboardItems, toast]);
 
   const updateCupboardItem = useCallback(async (itemId: string, form: any) => {
     const existing = cupboardItems.find(i => i.Item_ID === itemId);
@@ -1485,21 +1792,22 @@ export function useCupboards() {
     };
 
     try {
-      await postSheetRow('Cupboard_Items', updatedItem);
-
-      await loadFromBackend(false);
-
+      await updateLocalCache('Cupboard_Items', updatedItem, 'Item_ID');
       toast({ title: 'Updated', description: 'Item updated.' });
+
+      // Queue write
+      queueWrite(
+        () => postSheetRow('Cupboard_Items', updatedItem),
+        `Update Cupboard Item ID ${itemId}`,
+        { type: 'postRow', tabName: 'Cupboard_Items', rowData: updatedItem }
+      ).catch(err => console.error("Failed to queue Cupboard Item update:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({
-        title: 'Network Error',
-        description: 'Failed to update item on Google Sheets. ' + err.message,
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: 'Failed to update cupboard item: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [cupboardItems, loadFromBackend, toast]);
+  }, [cupboardItems, toast]);
 
   const deleteCupboardItem = useCallback(async (itemId: string) => {
     const existing = cupboardItems.find(i => i.Item_ID === itemId);
@@ -1517,21 +1825,22 @@ export function useCupboards() {
     };
 
     try {
-      await postSheetRow('Cupboard_Items', deletedItem);
-
-      await loadFromBackend(false);
-
+      await updateLocalCache('Cupboard_Items', deletedItem, 'Item_ID');
       toast({ title: 'Removed', description: 'Item deleted from cupboard.' });
+
+      // Queue write
+      queueWrite(
+        () => postSheetRow('Cupboard_Items', deletedItem),
+        `Delete Cupboard Item ID ${itemId}`,
+        { type: 'postRow', tabName: 'Cupboard_Items', rowData: deletedItem }
+      ).catch(err => console.error("Failed to queue Cupboard Item delete:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({
-        title: 'Network Error',
-        description: 'Failed to delete item from Google Sheets. ' + err.message,
-        variant: 'destructive'
-      });
+      toast({ title: 'Error', description: 'Failed to delete item from cupboard: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [cupboardItems, loadFromBackend, toast]);
+  }, [cupboardItems, toast]);
 
   return {
     cupboards,
@@ -1543,47 +1852,76 @@ export function useCupboards() {
     updateCupboardItem,
     deleteCupboardItem,
     loading,
-    refresh: () => loadFromBackend(true)
+    refresh: () => {
+      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    }
   };
 }
 
-// 10b. BOXES / PLACEMENTS HOOK (per-item storage location inside a cupboard)
+// 10b. BOXES / PLACEMENTS HOOK
 export function useBoxesAndPlacements() {
-  const [boxes, setBoxes] = useLocalState<Box[]>('sicca_boxes', DEMO_BOXES);
-  const [placements, setPlacements] = useLocalState<Placement[]>('sicca_placements', DEMO_PLACEMENTS);
-  const { toast } = useToast();
+  const [boxes, setBoxes] = useState<Box[]>([]);
+  const [placements, setPlacements] = useState<Placement[]>([]);
   const [loading, setLoading] = useState(true);
-  const [recycleBin, setRecycleBin] = useLocalState<RecycleItem[]>('sicca_recycle_bin', DEMO_RECYCLE_BIN);
+  const { toast } = useToast();
 
-  const loadFromBackend = useCallback(async (isInitial = false) => {
+  const loadAll = useCallback(async (isInitial = false) => {
     if (isInitial) setLoading(true);
     try {
-      const [rawBoxes, rawPlacements] = await Promise.all([
-        fetchSheetTab('database', 'Boxes'),
-        fetchSheetTab('database', 'Placements'),
+      const [c1, c2] = await Promise.all([
+        getCached('Boxes'),
+        getCached('Placements')
       ]);
-      const boxMap = new Map<string, Box>();
-      rawBoxes.forEach((b: any) => { if (b.Box_ID && b.Status !== 'Deleted') boxMap.set(b.Box_ID, b); });
-      const placementMap = new Map<string, Placement>();
-      rawPlacements.forEach((p: any) => { if (p.Placement_ID) placementMap.set(p.Placement_ID, p); });
-      setBoxes(Array.from(boxMap.values()));
-      setPlacements(Array.from(placementMap.values()));
-    } catch (err: any) {
-      console.error('Failed to load boxes/placements:', err);
-      if (isInitial) {
-        toast({ title: 'Showing demo data — backend unreachable', description: 'Using local fallback data.', variant: 'destructive' });
+      
+      let rawBoxes = c1?.data;
+      let rawPlacements = c2?.data;
+
+      if (!rawBoxes || !rawPlacements) {
+        const [r1, r2] = await Promise.all([
+          fetchSheetTab('database', 'Boxes'),
+          fetchSheetTab('database', 'Placements')
+        ]);
+        rawBoxes = r1;
+        rawPlacements = r2;
+        await Promise.all([
+          idbSet('Boxes', { data: r1, syncedAt: Date.now() }),
+          idbSet('Placements', { data: r2, syncedAt: Date.now() })
+        ]);
       }
+
+      setBoxes(rawBoxes.filter((b: any) => b.Status !== 'Deleted'));
+      setPlacements(rawPlacements);
+    } catch (err) {
+      console.error('Failed to load boxes/placements:', err);
+      setBoxes(DEMO_BOXES);
+      setPlacements(DEMO_PLACEMENTS);
     } finally {
-      if (isInitial) setLoading(false);
+      setLoading(false);
     }
-  }, [setBoxes, setPlacements, toast]);
+  }, []);
 
   useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => loadFromBackend(false), delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
+    loadAll(true);
+
+    const unsub = subscribeSync((tab) => {
+      if (['Boxes', 'Placements'].includes(tab || '')) {
+        loadAll(false);
+      }
+    });
+
+    const handleCustom = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (['Boxes', 'Placements'].includes(detail.tab || '')) {
+        loadAll(false);
+      }
+    };
+    window.addEventListener('sync-tab-updated', handleCustom);
+
+    return () => {
+      unsub();
+      window.removeEventListener('sync-tab-updated', handleCustom);
+    };
+  }, [loadAll]);
 
   const getBoxesForCupboard = useCallback(
     (cupboardId: string) => boxes.filter(b => b.Cupboard_ID === cupboardId),
@@ -1601,17 +1939,23 @@ export function useBoxesAndPlacements() {
       Created_On: new Date().toLocaleString(), Status: 'Active'
     };
     try {
-      await postSheetRow('Boxes', newBox);
-      setBoxes(prev => [...prev, newBox]);
+      await updateLocalCache('Boxes', newBox, 'Box_ID');
       addSystemLog('CREATE_BOX', `Box "${boxName}" added to cupboard ID ${cupboardId}`);
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Boxes', newBox),
+        `Add box "${boxName}" (ID: ${newBox.Box_ID})`,
+        { type: 'postRow', tabName: 'Boxes', rowData: newBox }
+      ).catch(err => console.error("Failed to queue Box write:", err));
+
       return { success: true, box: newBox };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to create box. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to create box: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [boxes, setBoxes, toast]);
+  }, [boxes, toast]);
 
-  // Creates a new placement row, or bumps quantity on an existing (item, cupboard, box) match.
   const addPlacement = useCallback(async (itemCode: string, cupboardId: string, boxId: string, quantity: number) => {
     const existing = placements.find(p => p.Item_Code === itemCode && p.Cupboard_ID === cupboardId && p.Box_ID === boxId);
     const now = new Date().toLocaleString();
@@ -1628,60 +1972,78 @@ export function useBoxesAndPlacements() {
           Quantity: String(quantity), Last_Updated: now
         };
     try {
-      await postSheetRow('Placements', row);
-      setPlacements(prev => existing ? prev.map(p => p.Placement_ID === row.Placement_ID ? row : p) : [...prev, row]);
+      await updateLocalCache('Placements', row, 'Placement_ID');
       addSystemLog('ADD_PLACEMENT', `Placed quantity ${quantity} for item "${itemCode}" in Box ID ${boxId}`);
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Placements', row),
+        `Add placement for item ${itemCode} in Box ${boxId}`,
+        { type: 'postRow', tabName: 'Placements', rowData: row }
+      ).catch(err => console.error("Failed to queue Placement write:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to save location. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to save location: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [placements, setPlacements, toast]);
+  }, [placements, toast]);
 
-  // Zeroes out a placement's quantity (frees it back to "unassigned") — the generic sheet
-  // writer is append-only, so "remove" is an update-by-same-ID to Quantity: 0, same idiom
-  // as updateItem/updateCupboard. Callers should filter qty <= 0 out of box item lists.
   const removePlacement = useCallback(async (placementId: string) => {
     const existing = placements.find(p => p.Placement_ID === placementId);
     if (!existing) return { success: false, error: 'Placement not found' };
     const row: Placement = { ...existing, Quantity: '0', Last_Updated: new Date().toLocaleString() };
     try {
-      await postSheetRow('Placements', row);
-      setPlacements(prev => prev.map(p => p.Placement_ID === placementId ? row : p));
+      await updateLocalCache('Placements', row, 'Placement_ID');
       addSystemLog('REMOVE_PLACEMENT', `Removed item "${existing.Item_Code}" placement from Box ID ${existing.Box_ID}`);
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Placements', row),
+        `Remove placement ID ${placementId}`,
+        { type: 'postRow', tabName: 'Placements', rowData: row }
+      ).catch(err => console.error("Failed to queue Placement remove:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to remove item. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to remove item: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [placements, setPlacements, toast]);
+  }, [placements, toast]);
 
-  // Reduces a placement's quantity by a partial amount (e.g. an Outward pick from that
-  // location) — same update-by-same-ID idiom as removePlacement, but subtracts rather
-  // than zeroing. Never goes below 0.
   const reducePlacementQty = useCallback(async (placementId: string, qtyToRemove: number) => {
     const existing = placements.find(p => p.Placement_ID === placementId);
     if (!existing) return { success: false, error: 'Placement not found' };
     const nextQty = Math.max(0, parseFloat(existing.Quantity || '0') - qtyToRemove);
     const row: Placement = { ...existing, Quantity: String(nextQty), Last_Updated: new Date().toLocaleString() };
     try {
-      await postSheetRow('Placements', row);
-      setPlacements(prev => prev.map(p => p.Placement_ID === placementId ? row : p));
+      await updateLocalCache('Placements', row, 'Placement_ID');
       addSystemLog('REDUCE_PLACEMENT', `Took ${qtyToRemove} of "${existing.Item_Code}" from Box ID ${existing.Box_ID}`);
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Placements', row),
+        `Reduce placement ID ${placementId} qty by ${qtyToRemove}`,
+        { type: 'postRow', tabName: 'Placements', rowData: row }
+      ).catch(err => console.error("Failed to queue Placement reduce:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to update location quantity. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to update location quantity: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [placements, setPlacements, toast]);
+  }, [placements, toast]);
 
   const deleteBox = useCallback(async (boxId: string) => {
     const existing = boxes.find(b => b.Box_ID === boxId);
     if (!existing) return { success: false, error: 'Box not found' };
     const deletedBox: Box & { Status?: string } = { ...existing, Status: 'Deleted' };
+    
     try {
-      await postSheetRow('Boxes', deletedBox);
+      // 1. Update Boxes
+      await updateLocalCache('Boxes', deletedBox, 'Box_ID');
 
+      // 2. Add to Recycle Bin
       const newBinItem: RecycleItem = {
         Bin_ID: 'BIN-' + Date.now(),
         Original_ID: existing.Box_ID,
@@ -1690,7 +2052,7 @@ export function useBoxesAndPlacements() {
         Deleted_By: 'Admin',
         Date_Time: new Date().toLocaleString()
       };
-      setRecycleBin(prev => [newBinItem, ...prev]);
+      await updateLocalCache('Recycle_Bin', newBinItem, 'Bin_ID');
 
       if (isClient) {
         const backups = getStored<Record<string, any>>('sicca_box_backups', {});
@@ -1700,69 +2062,49 @@ export function useBoxesAndPlacements() {
         setStored('sicca_box_backups', backups);
       }
 
-      setBoxes(prev => prev.filter(b => b.Box_ID !== boxId));
-      // Also set placements in this box to Quantity: 0
-      const boxPlacements = placements.filter(p => p.Box_ID === boxId && parseFloat(p.Quantity || '0') > 0);
+      // 3. Clear Box Placements
+      const cachedPlacements = await getCached('Placements');
+      const rawPlacements = cachedPlacements?.data || [];
+      const boxPlacements = rawPlacements.filter((p: any) => p.Box_ID === boxId && parseFloat(p.Quantity || '0') > 0);
+      let nextPlacements = [...rawPlacements];
+
       for (const p of boxPlacements) {
         const row: Placement = { ...p, Quantity: '0', Last_Updated: new Date().toLocaleString() };
-        await postSheetRow('Placements', row);
-        setPlacements(prev => prev.map(old => old.Placement_ID === p.Placement_ID ? row : old));
+        nextPlacements = updateRawData(nextPlacements, row, 'Placement_ID');
+        queueWrite(
+          () => postSheetRow('Placements', row),
+          `Clear Placement ${p.Placement_ID} on Box deletion`,
+          { type: 'postRow', tabName: 'Placements', rowData: row }
+        ).catch(err => console.error("Failed to queue Placement clear write:", err));
       }
+
+      await idbSet('Placements', { data: nextPlacements, syncedAt: Date.now() });
+      window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Placements', data: nextPlacements } }));
+
+      // Queue Box deletion write
+      queueWrite(
+        () => postSheetRow('Boxes', deletedBox),
+        `Delete box "${existing.Box_Name}" (ID: ${boxId})`,
+        { type: 'postRow', tabName: 'Boxes', rowData: deletedBox }
+      ).catch(err => console.error("Failed to queue Box delete write:", err));
+
       addSystemLog('DELETE_BOX', `Box "${existing.Box_Name}" deleted`);
       toast({ title: 'Deleted', description: 'Box moved to Recovery Vault.' });
       return { success: true };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to delete box. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to delete box: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [boxes, setBoxes, placements, setPlacements, setRecycleBin, toast]);
+  }, [boxes, placements, toast]);
 
-  return { boxes, placements, getBoxesForCupboard, addBox, addPlacement, removePlacement, reducePlacementQty, deleteBox, loading, refresh: () => loadFromBackend(true) };
+  return { boxes, placements, getBoxesForCupboard, addBox, addPlacement, removePlacement, reducePlacementQty, deleteBox, loading, refresh: () => loadAll(true) };
 }
 
-// 10c. EMPLOYEES (sourced from Users tab — autocomplete + unverified "+ New" for Inward form)
+// 10c. EMPLOYEES HOOK
 export function useEmployees() {
-  const [employees, setEmployees] = useLocalState<User[]>('sicca_employees', DEMO_USERS);
-  const [hiddenEmployees, setHiddenEmployees] = useLocalState<string[]>('sicca_hidden_employees', []);
+  const [employees, setEmployees, loading] = useSyncTabState<User>('Users', DEMO_USERS, data => data.filter((u: any) => u.Status !== 'Deleted'));
   const { toast } = useToast();
-  const [loading, setLoading] = useState(true);
 
-  const loadFromBackend = useCallback(async (isInitial = false) => {
-    if (isInitial) setLoading(true);
-    try {
-      const raw = await fetchSheetTab('database', 'Users');
-      const userMap = new Map<string, User>();
-      raw.forEach((u: any) => { if (u.User_ID) userMap.set(u.User_ID, u); });
-      setEmployees(Array.from(userMap.values()).filter((u: any) => u.Status !== 'Deleted'));
-    } catch (err: any) {
-      console.error('Failed to load employees:', err);
-      if (isInitial) {
-        toast({ title: 'Showing demo data — backend unreachable', description: 'Using local fallback data.', variant: 'destructive' });
-      }
-    } finally {
-      if (isInitial) setLoading(false);
-    }
-  }, [setEmployees, toast]);
-
-  useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => loadFromBackend(false), delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
-
-  const hideEmployee = useCallback((name: string) => {
-    setHiddenEmployees(prev => {
-      if (prev.includes(name)) return prev;
-      return [...prev, name];
-    });
-  }, [setHiddenEmployees]);
-
-  const unhideEmployee = useCallback((name: string) => {
-    setHiddenEmployees(prev => prev.filter(n => n !== name));
-  }, [setHiddenEmployees]);
-
-  // Creates a lightweight, unverified employee record — not a login account (no password set).
   const addEmployee = useCallback(async (fullName: string) => {
     const newEmployee: Record<string, any> = {
       User_ID: 'USR-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
@@ -1771,59 +2113,45 @@ export function useEmployees() {
       Created_On: new Date().toLocaleString()
     };
     try {
-      await postSheetRow('Users', newEmployee);
-      setEmployees(prev => [...prev, newEmployee as User]);
+      await updateLocalCache('Users', newEmployee, 'User_ID');
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Users', newEmployee),
+        `Add unverified employee ${fullName}`,
+        { type: 'postRow', tabName: 'Users', rowData: newEmployee }
+      ).catch(err => console.error("Failed to queue Users employee write:", err));
+
       return { success: true, employee: newEmployee as User };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to add employee. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to add employee: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [setEmployees, toast]);
-
-  const filteredEmployees = useMemo(() => {
-    return employees.filter(emp => !hiddenEmployees.includes(emp.Full_Name));
-  }, [employees, hiddenEmployees]);
+  }, [toast]);
 
   return {
-    employees: filteredEmployees,
+    employees,
     rawEmployees: employees,
-    hiddenEmployees,
-    hideEmployee,
-    unhideEmployee,
     addEmployee,
     loading,
-    refresh: () => loadFromBackend(true)
+    refresh: () => {
+      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    }
   };
 }
 
 // 10d. INVOICES HOOK
 export function useInvoices() {
-  const [invoices, setInvoices] = useLocalState<Invoice[]>('sicca_invoices', DEMO_INVOICES);
-  const { toast } = useToast();
-  const [loading, setLoading] = useState(true);
-
-  const loadFromBackend = useCallback(async (isInitial = false) => {
-    if (isInitial) setLoading(true);
-    try {
-      const raw = await fetchSheetTab('database', 'Invoices');
-      const list = raw.filter((i: any) => i.Invoice_No && String(i.Invoice_No).trim() !== '');
-      setInvoices(list);
-    } catch (err: any) {
-      console.error('Failed to load invoices:', err);
-      if (isInitial) {
-        toast({ title: 'Showing demo data — backend unreachable', description: 'Using local fallback data.', variant: 'destructive' });
+  const [invoices, setInvoices, loading] = useSyncTabState<Invoice>('Invoices', DEMO_INVOICES, data => {
+    const invoiceMap = new Map<string, Invoice>();
+    data.forEach((i: any) => {
+      if (i.Invoice_No && String(i.Invoice_No).trim() !== '') {
+        invoiceMap.set(i.Invoice_No.trim().toLowerCase(), i);
       }
-    } finally {
-      if (isInitial) setLoading(false);
-    }
-  }, [setInvoices, toast]);
-
-  useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => loadFromBackend(false), delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
+    });
+    return Array.from(invoiceMap.values()).filter((i: any) => i.Status !== 'Deleted');
+  });
+  const { toast } = useToast();
 
   const addInvoice = useCallback(async (form: { invoiceNo: string; vendorName: string; date: string; employeeName: string; totalValue: number }) => {
     const newInvoice: Invoice = {
@@ -1832,16 +2160,66 @@ export function useInvoices() {
       Created_On: new Date().toLocaleString()
     };
     try {
-      await postSheetRow('Invoices', newInvoice);
-      setInvoices(prev => [...prev, newInvoice]);
+      await updateLocalCache('Invoices', newInvoice, 'Invoice_No');
+
+      // Queue write
+      queueWrite(
+        () => postSheetRow('Invoices', newInvoice),
+        `Add Invoice ${form.invoiceNo}`,
+        { type: 'postRow', tabName: 'Invoices', rowData: newInvoice }
+      ).catch(err => console.error("Failed to queue Invoices write:", err));
+
       return { success: true };
     } catch (err: any) {
-      toast({ title: 'Network Error', description: 'Failed to save invoice. ' + err.message, variant: 'destructive' });
+      toast({ title: 'Error', description: 'Failed to save invoice: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [setInvoices, toast]);
+  }, [toast]);
 
-  return { invoices, addInvoice, loading, refresh: () => loadFromBackend(true) };
+  const deleteInvoice = useCallback(async (invoiceNo: string) => {
+    try {
+      const cachedInvoices = await getCached('Invoices');
+      const rawInvoices = cachedInvoices?.data || [];
+      const invoiceToDelete = rawInvoices.find((inv: any) => inv.Invoice_No === invoiceNo);
+      
+      if (invoiceToDelete) {
+        const deletedInvoice = { ...invoiceToDelete, Status: 'Deleted' };
+        await updateLocalCache('Invoices', deletedInvoice, 'Invoice_No');
+
+        // Queue write
+        queueWrite(
+          () => postSheetRow('Invoices', deletedInvoice),
+          `Delete Invoice ${invoiceNo}`,
+          { type: 'postRow', tabName: 'Invoices', rowData: deletedInvoice }
+        ).catch(err => console.error("Failed to queue Invoice delete write:", err));
+      }
+
+      // Filter out stock register entries associated with this invoice
+      const cachedEntries = await getCached('Stock_Register');
+      const rawEntries = cachedEntries?.data || [];
+      const affectedEntries = rawEntries.filter((e: any) => e.Invoice_No === invoiceNo);
+      const remainingEntries = rawEntries.filter((e: any) => e.Invoice_No !== invoiceNo);
+
+      await idbSet('Stock_Register', { data: remainingEntries, syncedAt: Date.now() });
+      window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Stock_Register', data: remainingEntries } }));
+
+      addSystemLog('DELETE_INVOICE', `Invoice "${invoiceNo}" deleted (removed ${affectedEntries.length} associated stock entries)`);
+
+      toast({ 
+        title: 'Invoice Deleted', 
+        description: `Invoice ${invoiceNo} and its ${affectedEntries.length} associated stock entries have been removed.` 
+      });
+
+      return { success: true, affectedCount: affectedEntries.length };
+    } catch (err: any) {
+      toast({ title: 'Error', description: 'Failed to delete invoice: ' + err.message, variant: 'destructive' });
+      return { success: false };
+    }
+  }, [toast]);
+
+  return { invoices, addInvoice, deleteInvoice, loading, refresh: () => {
+    fullSync().catch(err => console.error("Sync failed on refresh:", err));
+  } };
 }
 
 // 11. GST SUMMARY HOOK
@@ -1850,7 +2228,6 @@ export function useGstSummary() {
 
   const inwardEntries = entries.filter(e => e.Transaction_Type === 'Inward');
   
-  // Dynamically group by rate
   const rates = [28, 18, 12, 5, 0];
   const byRate = rates.map(rate => {
     const filtered = inwardEntries.filter(e => parseFloat(e.GST_Rate || '0') === rate);
@@ -1884,15 +2261,34 @@ export function useGstSummary() {
 
 // 12. SETTINGS HOOK
 export function useSettings() {
-  const [settings, setSettings] = useLocalState<any>('sicca_settings', DEMO_SETTINGS);
+  const [settings, setSettings, loading] = useSyncTabState<any>('Settings', [DEMO_SETTINGS], data => data);
   const { toast } = useToast();
 
-  const saveSettings = useCallback((newSettings: any) => {
-    setSettings((prev: any) => ({ ...prev, ...newSettings }));
-    addSystemLog('SAVE_SETTINGS', 'System settings saved');
-    toast({ title: 'Success', description: 'System settings updated.' });
-    return { success: true };
-  }, [setSettings, toast]);
+  const currentSettings = useMemo(() => Array.isArray(settings) ? settings[0] : settings, [settings]);
+
+  const saveSettings = useCallback(async (newSettings: any) => {
+    const updated = { ...currentSettings, ...newSettings };
+    try {
+      const nextRaw = [updated];
+      await idbSet('Settings', { data: nextRaw, syncedAt: Date.now() });
+      window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Settings', data: nextRaw } }));
+
+      addSystemLog('SAVE_SETTINGS', 'System settings saved');
+      toast({ title: 'Success', description: 'System settings updated.' });
+
+      // Queue network write
+      queueWrite(
+        () => postSheetRow('Settings', updated),
+        'Save system settings',
+        { type: 'postRow', tabName: 'Settings', rowData: updated }
+      ).catch(err => console.error("Failed to queue Settings write:", err));
+
+      return { success: true };
+    } catch (err: any) {
+      toast({ title: 'Error', description: 'Failed to save settings: ' + err.message, variant: 'destructive' });
+      return { success: false };
+    }
+  }, [currentSettings, toast]);
 
   const changePassword = useCallback((data: any) => {
     addSystemLog('SAVE_SETTINGS', 'Admin password changed');
@@ -1900,7 +2296,7 @@ export function useSettings() {
   }, []);
 
   return {
-    settings,
+    settings: currentSettings,
     saveSettings,
     changePassword
   };
@@ -1918,63 +2314,48 @@ export type Task = {
 };
 
 export function useTasks() {
-  const [tasks, setTasks] = useLocalState<Task[]>('sicca_tasks', []);
+  const [tasks, setTasks, loading] = useSyncTabState<Task>('Tasks', [], data => data.filter((t: any) => t.Status !== 'Deleted').reverse());
   const { toast } = useToast();
-  const [loading, setLoading] = useState(true);
-
-  const loadFromBackend = useCallback(async (isInitial = false) => {
-    if (isInitial) setLoading(true);
-    try {
-      const data = await fetchSheetTab('database', 'Tasks');
-      if (data) {
-        setTasks([...data].reverse() as Task[]);
-      }
-    } catch (err: any) {
-      console.error('Failed to load tasks:', err);
-      if (isInitial) {
-        toast({ title: 'Showing demo data — backend unreachable', description: 'Using local fallback data.', variant: 'destructive' });
-      }
-    } finally {
-      if (isInitial) setLoading(false);
-    }
-  }, [setTasks, toast]);
-
-  useEffect(() => {
-    loadFromBackend(true);
-    const delay = 30000 + Math.floor(Math.random() * 8000);
-    const interval = setInterval(() => loadFromBackend(false), delay);
-    return () => clearInterval(interval);
-  }, [loadFromBackend]);
 
   const updateTaskStatus = useCallback(async (taskId: string, status: string) => {
-    setTasks(prev => prev.map(t => t.Task_ID === taskId ? { ...t, Status: status } : t));
-    addSystemLog('TASK_UPDATE', `Task ID ${taskId} changed status to "${status}"`);
     try {
-      const urlStr = process.env.NEXT_PUBLIC_SHEETS_API_URL;
-      if (!urlStr) throw new Error('NEXT_PUBLIC_SHEETS_API_URL not configured');
-      
-      const res = await fetch(urlStr, {
-        method: 'POST',
-        headers: { 'Content-Type': 'text/plain' },
-        body: JSON.stringify({
-          action: 'updateTaskStatus',
-          taskId,
-          status,
-          token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
-        })
-      });
-      if (!res.ok) throw new Error(`HTTP error ${res.status}`);
-      const json = await res.json();
-      if (!json || json.success === false) {
-        throw new Error(json?.error || 'Failed to update task status');
+      const cached = await getCached('Tasks');
+      const raw = cached?.data || [];
+      const task = raw.find((t: any) => t.Task_ID === taskId);
+      if (task) {
+        const updated = { ...task, Status: status };
+        const nextRaw = updateRawData(raw, updated, 'Task_ID');
+        await idbSet('Tasks', { data: nextRaw, syncedAt: Date.now() });
+        window.dispatchEvent(new CustomEvent('sync-tab-updated', { detail: { tab: 'Tasks', data: nextRaw } }));
+
+        addSystemLog('TASK_UPDATE', `Task ID ${taskId} changed status to "${status}"`);
+
+        const urlStr = process.env.NEXT_PUBLIC_SHEETS_API_URL;
+        if (!urlStr) throw new Error('NEXT_PUBLIC_SHEETS_API_URL not configured');
+
+        queueWrite(
+          () => fetch(urlStr, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            body: JSON.stringify({
+              action: 'updateTaskStatus',
+              taskId,
+              status,
+              token: localStorage.getItem('sicca_session_token') || 'demo-admin-token'
+            })
+          }).then(res => res.json()),
+          `Update task ID ${taskId} status to ${status}`
+        ).catch(err => console.error("Failed to queue updateTaskStatus:", err));
       }
+
       return { success: true };
     } catch (err: any) {
-      loadFromBackend(false);
       toast({ title: 'Error', description: 'Failed to update task status: ' + err.message, variant: 'destructive' });
       return { success: false, error: err.message };
     }
-  }, [setTasks, loadFromBackend, toast]);
+  }, [toast]);
 
-  return { tasks, updateTaskStatus, loading, refresh: () => loadFromBackend(true) };
+  return { tasks, updateTaskStatus, loading, refresh: () => {
+    fullSync().catch(err => console.error("Sync failed on refresh:", err));
+  } };
 }
