@@ -81,6 +81,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (process.env.NODE_ENV !== 'production') {
       const storedDev = localStorage.getItem('sicca_dev_view_as');
       if (storedDev) setDevViewAsUserIdState(storedDev);
+
+      // Dev-only session bootstrap (testing/automation): a synthetic session
+      // with no backend validation. Same gating as the View As switcher;
+      // dead code in production builds.
+      if (localStorage.getItem('sicca_dev_session')) {
+        setToken('dev-session');
+        setLoggedInUser({ id: 'DEV', name: 'Dev Session', email: 'dev@local', role: 'Super Admin', department: '' });
+        setLoading(false);
+        return;
+      }
     }
 
     // Restore real session
