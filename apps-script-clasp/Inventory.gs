@@ -432,14 +432,14 @@ function handleSaveInwardBatch(body, ss) {
       var total = taxable + cgst + sgst;
 
       // Balance
-      var itemKey = (itemCode || row.itemName || '').trim().toLowerCase();
-      var nameKey = (row.itemName || '').trim().toLowerCase();
+      var itemKey = String(itemCode || row.itemName || '').trim().toLowerCase();
+      var nameKey = String(row.itemName || '').trim().toLowerCase();
       var currentBalance = balances[itemKey] || balances[nameKey] || 0;
       var newBalance = currentBalance + inQty;
       
       // Update running balances in map
-      if (itemCode) balances[itemCode.trim().toLowerCase()] = newBalance;
-      if (row.itemName) balances[row.itemName.trim().toLowerCase()] = newBalance;
+      if (itemCode) balances[String(itemCode).trim().toLowerCase()] = newBalance;
+      if (row.itemName) balances[String(row.itemName).trim().toLowerCase()] = newBalance;
 
       // Append stock register entry
       var entryId = generateId('ENT');

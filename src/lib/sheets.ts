@@ -95,8 +95,13 @@ async function rawFetchSheetTab(sheetType: string, tabName: string): Promise<any
   return json.data || [];
 }
 
-export async function fetchSheetTab(sheetType: string, tabName: string): Promise<any[]> {
+export async function fetchSheetTab(sheetType: string, tabName: string, forceRefresh?: boolean): Promise<any[]> {
   const key = `${sheetType}:${tabName}`;
+  
+  if (forceRefresh) {
+    tabCache.delete(key);
+  }
+
   const hit = tabCache.get(key);
   const hidden = typeof document !== 'undefined' && document.hidden;
   // Fresh cache, or any cache at all while the tab is hidden → no network.

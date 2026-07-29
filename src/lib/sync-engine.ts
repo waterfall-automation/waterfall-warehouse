@@ -132,14 +132,17 @@ async function updateTab(tab: string, data: any[]) {
 }
 
 // ── FULL SYNC FUNCTION ────────────────────────────────────────────────────
-async function performFullSyncInternal(onProgress?: (done: number, total: number) => void): Promise<void> {
+async function performFullSyncInternal(
+  onProgress?: (done: number, total: number) => void,
+  forceRefresh?: boolean
+): Promise<void> {
   let doneCount = 0;
   const totalCount = SYNC_TABS.length;
 
   // fetchSheetTab has a 4-way concurrency governor, so we fire all fetches
   // concurrently and let the sheets.ts governor queue/throttle them.
   const promises = SYNC_TABS.map(async (tab) => {
-    const data = await fetchSheetTab("database", tab);
+    const data = await fetchSheetTab("database", tab, forceRefresh);
     await updateTab(tab, data);
     doneCount++;
     onProgress?.(doneCount, totalCount);
@@ -148,12 +151,18 @@ async function performFullSyncInternal(onProgress?: (done: number, total: number
   await Promise.all(promises);
 }
 
-export async function fullSync(onProgress?: (done: number, total: number) => void): Promise<void> {
+export async function fullSync(
+  onProgress?: ((done: number, total: number) => void) | boolean,
+  forceRefresh?: boolean
+): Promise<void> {
+  const actualOnProgress = typeof onProgress === "function" ? onProgress : undefined;
+  const actualForceRefresh = typeof onProgress === "boolean" ? onProgress : !!forceRefresh;
+
   syncStatus = "syncing";
   notifyStatus();
   
   try {
-    await performFullSyncInternal(onProgress);
+    await performFullSyncInternal(actualOnProgress, actualForceRefresh);
     syncStatus = "idle";
     lastSyncedAt = Date.now();
     await idbSet("__last_full_sync__", lastSyncedAt);

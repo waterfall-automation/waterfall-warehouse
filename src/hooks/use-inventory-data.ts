@@ -431,7 +431,7 @@ export function useInventoryEntries() {
     deleteEntry,
     loading,
     refresh: () => {
-      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+      fullSync(true).catch(err => console.error("Sync failed on refresh:", err));
     }
   };
 }
@@ -2137,7 +2137,7 @@ export function useEmployees() {
     addEmployee,
     loading,
     refresh: () => {
-      fullSync().catch(err => console.error("Sync failed on refresh:", err));
+      fullSync(true).catch(err => console.error("Sync failed on refresh:", err));
     }
   };
 }
@@ -2220,7 +2220,7 @@ export function useInvoices() {
   }, [toast]);
 
   return { invoices, addInvoice, deleteInvoice, loading, refresh: () => {
-    fullSync().catch(err => console.error("Sync failed on refresh:", err));
+    fullSync(true).catch(err => console.error("Sync failed on refresh:", err));
   } };
 }
 
