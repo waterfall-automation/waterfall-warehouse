@@ -15,7 +15,8 @@ import {
   useItemMaster, 
   useBoxesAndPlacements, 
   useInventoryEntries, 
-  useCupboards 
+  useCupboards,
+  useInvoices
 } from '@/hooks/use-inventory-data';
 import { getSimilarity, safeStr } from '@/lib/utils';
 
@@ -28,6 +29,7 @@ export default function ItemDetailPage() {
   const { cupboards, loading: loadingCupboards } = useCupboards();
   const { boxes, placements, loading: loadingPlacements } = useBoxesAndPlacements();
   const { entries, loading: loadingEntries } = useInventoryEntries();
+  const { invoices } = useInvoices();
 
   const isLoading = loadingItems || loadingEntries || loadingPlacements || loadingCupboards;
 
@@ -248,7 +250,28 @@ export default function ItemDetailPage() {
                             <TableCell className="text-xs">
                               {e.Transaction_Type === 'Inward' ? (
                                 <div className="space-y-0.5">
-                                  {e.Invoice_No && <p className="font-semibold text-gray-800">Inv: {e.Invoice_No}</p>}
+                                  {e.Invoice_No && (
+                                    (() => {
+                                      const invRec = invoices?.find(
+                                        inv => inv.Invoice_No && String(inv.Invoice_No).trim().toLowerCase() === String(e.Invoice_No).trim().toLowerCase()
+                                      );
+                                      return invRec?.Invoice_File_URL ? (
+                                        <p className="font-semibold text-gray-800">
+                                          Inv:{' '}
+                                          <a
+                                            href={invRec.Invoice_File_URL}
+                                            target="_blank"
+                                            rel="noopener noreferrer"
+                                            className="text-blue-600 hover:text-blue-800 hover:underline"
+                                          >
+                                            {e.Invoice_No}
+                                          </a>
+                                        </p>
+                                      ) : (
+                                        <p className="font-semibold text-gray-800">Inv: {e.Invoice_No}</p>
+                                      );
+                                    })()
+                                  )}
                                   {e.Vendor_Name && <p className="text-[10px] text-muted-foreground leading-none">Vendor: {e.Vendor_Name}</p>}
                                 </div>
                               ) : (

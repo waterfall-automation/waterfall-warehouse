@@ -13,6 +13,7 @@ import { useToast } from '@/hooks/use-toast';
 import { cn } from '@/lib/utils';
 import { Invoice } from '@/lib/demo-data';
 import { useAuth } from '@/context/auth-context';
+import { LocationPicker as SharedLocationPicker } from '@/components/shared/location-picker';
 
 type LocationAllocation = {
   key: string;
@@ -203,39 +204,38 @@ function LocationPicker({ rowQty, value, onChange }: {
           {rowQty > 0 && (
             <p className="text-xs text-gray-500">Remaining to place: <span className="font-semibold text-gray-700">{remaining}</span> of {rowQty}</p>
           )}
-          <div>
-            <label className="text-xs font-semibold text-gray-700">Cupboard</label>
-            <div className="mt-1">
-              <AutocompleteInput
-                value={cupboardText}
-                onChangeText={v => { setCupboardText(v); setCupboardId(''); }}
-                options={cupboards}
-                getLabel={c => c.Name}
-                placeholder="Search or create cupboard…"
-                newLabelPrefix="Create cupboard"
-                onSelect={c => { setCupboardId(c.Cupboard_ID); setCupboardText(c.Name); setBoxId(''); setBoxText(''); }}
-                onCreateNew={handleCreateCupboard}
-              />
-            </div>
+          <div className="space-y-2">
+            <SharedLocationPicker
+              cupboards={cupboards}
+              boxes={boxes}
+              selectedCupboardId={cupboardId}
+              selectedBoxId={boxId}
+              onChange={(cupId, bId) => {
+                setCupboardId(cupId);
+                const cup = cupboards.find(c => c.Cupboard_ID === cupId);
+                setCupboardText(cup ? cup.Name : '');
+                setBoxId(bId);
+                const box = boxes.find(b => b.Box_ID === bId);
+                setBoxText(box ? box.Box_Name : '');
+              }}
+              onAddNewContainer={async () => {
+                const name = prompt("Enter new container name:");
+                if (name && name.trim()) {
+                  await handleCreateCupboard(name.trim());
+                }
+              }}
+              onAddNewBox={async (cupId) => {
+                const name = prompt("Enter new box name:");
+                if (name && name.trim()) {
+                  const res = await addBox(cupId, name.trim());
+                  if (res.success && res.box) {
+                    setBoxId(res.box.Box_ID);
+                    setBoxText(name.trim());
+                  }
+                }
+              }}
+            />
           </div>
-
-          {cupboardId && (
-            <div>
-              <label className="text-xs font-semibold text-gray-700">Box</label>
-              <div className="mt-1">
-                <AutocompleteInput
-                  value={boxText}
-                  onChangeText={v => { setBoxText(v); setBoxId(''); }}
-                  options={boxes}
-                  getLabel={b => b.Box_Name}
-                  placeholder="Search or create box…"
-                  newLabelPrefix="Create box"
-                  onSelect={b => { setBoxId(b.Box_ID); setBoxText(b.Box_Name); }}
-                  onCreateNew={handleCreateBox}
-                />
-              </div>
-            </div>
-          )}
 
           {boxId && (
             <div>
@@ -367,9 +367,10 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
     }
     const normalize = (str: string) => {
       return String(str || '')
-        .trim()
         .toLowerCase()
-        .replace(/\s+/g, ' '); // collapse spaces
+        .replace(/[-_.,]/g, ' ')   // convert punctuation to spaces
+        .replace(/\s+/g, ' ')      // collapse multiple spaces
+        .trim();
     };
     const normName = normalize(name);
     const matchByName = catalogItems.find(o => normalize(o.Item_Name) === normName);

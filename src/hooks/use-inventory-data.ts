@@ -1048,8 +1048,10 @@ export function useActivityLog() {
 }
 
 // 8. VENDORS HOOK
+const filterActiveVendors = (data: any[]): Vendor[] => data.filter(v => v.Status !== 'Deleted');
+
 export function useVendors() {
-  const [vendors, setVendors, loading] = useSyncTabState<Vendor>('Vendors', DEMO_VENDORS, data => data.filter(v => v.Status !== 'Deleted'));
+  const [vendors, setVendors, loading] = useSyncTabState<Vendor>('Vendors', DEMO_VENDORS, filterActiveVendors);
   const { toast } = useToast();
 
   const addVendor = useCallback(async (form: any) => {

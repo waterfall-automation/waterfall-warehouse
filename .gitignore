@@ -50,3 +50,6 @@ firestore-debug.log
 /test-results/
 /audit-screenshots/
 /playwright-report/
+
+.vercel
+.env*

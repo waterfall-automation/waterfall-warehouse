@@ -290,13 +290,13 @@ function localPost(action: string, body: any): any {
         const sgst = cgst;
         const total = taxable + cgst + sgst;
 
-        const itemKey = (itemCode || row.itemName || '').trim().toLowerCase();
-        const nameKey = (row.itemName || '').trim().toLowerCase();
+        const itemKey = String(itemCode || row.itemName || '').trim().toLowerCase();
+        const nameKey = String(row.itemName || '').trim().toLowerCase();
         const currentBalance = balances[itemKey] || balances[nameKey] || 0;
         const newBalance = currentBalance + inQty;
 
-        if (itemCode) balances[itemCode.trim().toLowerCase()] = newBalance;
-        if (row.itemName) balances[row.itemName.trim().toLowerCase()] = newBalance;
+        if (itemCode) balances[String(itemCode).trim().toLowerCase()] = newBalance;
+        if (row.itemName) balances[String(row.itemName).trim().toLowerCase()] = newBalance;
 
         const entryId = genId('ENT');
         store.entries.push({

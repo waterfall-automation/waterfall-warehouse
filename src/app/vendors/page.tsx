@@ -226,7 +226,7 @@ export default function VendorsPage() {
                   </div>
                   );
                 })}
-                {filtered.length === 0 && <div className="col-span-3 py-12 text-center text-muted-foreground">No vendors found</div>}
+                {filtered.length === 0 && <div className="col-span-full py-12 text-center text-muted-foreground">No vendors found</div>}
               </div>}
           </CardContent>
         </Card>
