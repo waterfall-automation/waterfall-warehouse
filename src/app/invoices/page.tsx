@@ -10,7 +10,7 @@ import { Input } from '@/components/ui/input';
 import { Badge } from '@/components/ui/badge';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog';
-import { FileText, Search, X, Package, RefreshCw, ArrowDownToLine, ArrowUpFromLine, ExternalLink, Trash2 } from 'lucide-react';
+import { FileText, Search, X, Package, RefreshCw, ArrowDownToLine, ArrowUpFromLine, ExternalLink, Trash2, Upload } from 'lucide-react';
 import { useInvoices, useInventoryEntries, useItemMaster } from '@/hooks/use-inventory-data';
 import { Button } from '@/components/ui/button';
 import { InfoPopup } from '@/components/shared/info-popup';
@@ -18,6 +18,8 @@ import { flashClick } from '@/lib/click-flash';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/context/auth-context';
 import { Skeleton } from '@/components/ui/skeleton';
+import { useToast } from '@/hooks/use-toast';
+import { Invoice } from '@/lib/demo-data';
 
 // Entries store Date_Time as "DD-MM-YYYY HH:mm" — parse that for chronological sort,
 // falling back to a direct Date parse for any other format already in the sheet.
@@ -67,6 +69,7 @@ export default function InvoicesPage() {
     console.log('Invoices refreshed:', invoices.length, invoices[0]);
   }, [invoices]);
 
+  const { toast } = useToast();
   const [search, setSearch] = useState('');
   const [activeInvoiceNo, setActiveInvoiceNo] = useState<string | null>(null);
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);
@@ -74,6 +77,82 @@ export default function InvoicesPage() {
   const [selectedVendor, setSelectedVendor] = useState<string | null>(null);
   const [selectedEmployee, setSelectedEmployee] = useState<string | null>(null);
   const [showDeleteConfirm, setShowDeleteConfirm] = useState(false);
+
+  const [attachModalOpen, setAttachModalOpen] = useState(false);
+  const [attachingInvoice, setAttachingInvoice] = useState<Invoice | null>(null);
+  const [attachmentFile, setAttachmentFile] = useState<{ base64Data: string; mimeType: string; name: string } | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = React.useRef<HTMLInputElement>(null);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      processFile(file);
+    }
+  };
+
+  const processFile = (file: File) => {
+    if (file.size > 10 * 1024 * 1024) {
+      toast({ title: 'File Too Large', description: 'Maximum file size is 10MB.', variant: 'destructive' });
+      return;
+    }
+    const reader = new FileReader();
+    reader.onloadend = () => {
+      setAttachmentFile({
+        base64Data: reader.result as string,
+        mimeType: file.type,
+        name: file.name
+      });
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleUploadAttachment = async () => {
+    if (!attachmentFile || !attachingInvoice) return;
+    setIsUploading(true);
+    try {
+      const urlStr = process.env.NEXT_PUBLIC_SHEETS_API_URL;
+      if (!urlStr) throw new Error('NEXT_PUBLIC_SHEETS_API_URL not configured');
+
+      const res = await fetch(urlStr, {
+        method: 'POST',
+        headers: { 'Content-Type': 'text/plain' },
+        body: JSON.stringify({
+          action: 'uploadInvoiceFile',
+          fileData: attachmentFile.base64Data,
+          mimeType: attachmentFile.mimeType,
+          invoiceNo: String(attachingInvoice.Invoice_No || '').trim(),
+          vendorName: String(attachingInvoice.Vendor_Name || '').trim(),
+          date: attachingInvoice.Date,
+          token: localStorage.getItem('sicca_token') || ''
+        })
+      });
+
+      if (!res.ok) throw new Error(`HTTP status ${res.status}`);
+      const json = await res.json();
+      if (json && json.success) {
+        toast({ title: 'Success', description: 'Invoice file successfully attached.' });
+        setAttachModalOpen(false);
+        setAttachmentFile(null);
+        setAttachingInvoice(null);
+        refreshInvoices();
+      } else {
+        toast({
+          title: 'Upload Failed',
+          description: json?.error || 'Failed to upload file.',
+          variant: 'destructive'
+        });
+      }
+    } catch (err: any) {
+      toast({
+        title: 'Upload Error',
+        description: 'Network or server error: ' + err.message,
+        variant: 'destructive'
+      });
+    } finally {
+      setIsUploading(false);
+    }
+  };
 
   // Deep-link support: /invoices?invoice=INV-123 auto-opens that invoice's detail panel
   // (used by Vendor Master's "Items Purchased" click-through).
@@ -349,7 +428,7 @@ export default function InvoicesPage() {
                     </span>
                     <span>Total <strong>₹{parseFloat(activeInvoice.Total_Value || '0').toLocaleString('en-IN')}</strong></span>
                   </div>
-                  {activeInvoice.Invoice_File_URL && (
+                  {activeInvoice.Invoice_File_URL ? (
                     <Button 
                       variant="secondary"
                       size="sm"
@@ -357,6 +436,19 @@ export default function InvoicesPage() {
                       className="w-full bg-white/20 hover:bg-white/30 text-white text-xs font-semibold h-8 rounded-lg flex items-center justify-center gap-1.5 border border-white/10"
                     >
                       <FileText className="h-3.5 w-3.5" /> View Invoice File
+                    </Button>
+                  ) : (
+                    <Button 
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => {
+                        setAttachingInvoice(activeInvoice);
+                        setAttachmentFile(null);
+                        setAttachModalOpen(true);
+                      }}
+                      className="w-full bg-white/20 hover:bg-white/30 text-white text-xs font-semibold h-8 rounded-lg flex items-center justify-center gap-1.5 border border-white/10"
+                    >
+                      <Upload className="h-3.5 w-3.5" /> Attach Photo
                     </Button>
                   )}
                 </div>
@@ -530,6 +622,91 @@ export default function InvoicesPage() {
                 className="flex-1 bg-red-600 hover:bg-red-700 text-white"
               >
                 Delete Invoice
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+
+      {attachModalOpen && attachingInvoice && (
+        <Dialog open={attachModalOpen} onOpenChange={(o) => {
+          if (!o && !isUploading) {
+            setAttachModalOpen(false);
+            setAttachmentFile(null);
+            setAttachingInvoice(null);
+          }
+        }}>
+          <DialogContent className="max-w-md">
+            <DialogHeader>
+              <DialogTitle>Attach Invoice File</DialogTitle>
+            </DialogHeader>
+            <div className="space-y-4 py-2">
+              <p className="text-xs text-muted-foreground">
+                Attach a photo or PDF invoice for <strong className="font-mono text-foreground">{attachingInvoice.Invoice_No}</strong> from <strong className="text-foreground">{attachingInvoice.Vendor_Name}</strong>.
+              </p>
+
+              <input
+                type="file"
+                ref={fileInputRef}
+                onChange={handleFileChange}
+                accept="application/pdf,image/*"
+                className="hidden"
+                disabled={isUploading}
+              />
+
+              {!attachmentFile ? (
+                <div
+                  onClick={() => fileInputRef.current?.click()}
+                  className="border-2 border-dashed border-muted-foreground/20 hover:border-primary/50 transition-colors rounded-xl p-8 text-center cursor-pointer space-y-2 bg-muted/5"
+                >
+                  <Upload className="h-8 w-8 mx-auto text-muted-foreground/40" />
+                  <p className="text-xs font-semibold text-gray-900">Click to select or upload a file</p>
+                  <p className="text-[10px] text-muted-foreground">Accepts PDF, PNG, JPG, SVG, WebP (Max 10MB)</p>
+                </div>
+              ) : (
+                <div className="border rounded-xl p-4 flex items-center justify-between gap-3 bg-muted/10">
+                  <div className="flex items-center gap-3 min-w-0">
+                    <div className="h-10 w-10 rounded-lg overflow-hidden border flex items-center justify-center shrink-0 bg-white">
+                      {attachmentFile.mimeType.startsWith('image/') ? (
+                        <img src={attachmentFile.base64Data} alt="Preview" className="w-full h-full object-cover" />
+                      ) : (
+                        <FileText className="h-5 w-5 text-primary" />
+                      )}
+                    </div>
+                    <div className="min-w-0">
+                      <p className="text-xs font-semibold text-gray-900 truncate">{attachmentFile.name}</p>
+                      <p className="text-[10px] text-muted-foreground font-mono truncate">{attachmentFile.mimeType}</p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => setAttachmentFile(null)}
+                    disabled={isUploading}
+                    className="text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50 shrink-0"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              )}
+            </div>
+            <DialogFooter className="gap-2 flex flex-col sm:flex-row">
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  setAttachModalOpen(false);
+                  setAttachmentFile(null);
+                  setAttachingInvoice(null);
+                }}
+                disabled={isUploading}
+                className="flex-1 border"
+              >
+                Cancel
+              </Button>
+              <Button
+                onClick={handleUploadAttachment}
+                disabled={isUploading || !attachmentFile}
+                className="flex-1 bg-primary text-primary-foreground hover:bg-primary/95"
+              >
+                {isUploading ? 'Uploading...' : 'Upload & Attach'}
               </Button>
             </DialogFooter>
           </DialogContent>
