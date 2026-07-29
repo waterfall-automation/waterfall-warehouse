@@ -17,6 +17,7 @@ import { InfoPopup } from '@/components/shared/info-popup';
 import { flashClick } from '@/lib/click-flash';
 import { cn } from '@/lib/utils';
 import { useAuth } from '@/context/auth-context';
+import { Skeleton } from '@/components/ui/skeleton';
 
 // Entries store Date_Time as "DD-MM-YYYY HH:mm" — parse that for chronological sort,
 // falling back to a direct Date parse for any other format already in the sheet.
@@ -38,12 +39,29 @@ export default function InvoicesPage() {
 
   const router = useRouter();
   const searchParams = useSearchParams();
-  const { invoices, deleteInvoice, loading: loadingInvoices } = useInvoices();
+  const { invoices, deleteInvoice, loading: loadingInvoices, refresh: refreshInvoices } = useInvoices();
   const { entries } = useInventoryEntries();
   const { items: catalogItems } = useItemMaster();
 
   const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+
+  useEffect(() => {
+    setMounted(true);
+    let active = true;
+    setIsRefreshing(true);
+    refreshInvoices()
+      .catch(err => console.error("Failed to refresh invoices on mount:", err))
+      .finally(() => {
+        if (active) {
+          setIsRefreshing(false);
+        }
+      });
+    return () => {
+      active = false;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const [search, setSearch] = useState('');
   const [activeInvoiceNo, setActiveInvoiceNo] = useState<string | null>(null);
@@ -113,14 +131,31 @@ export default function InvoicesPage() {
     ? entries.filter(e => e.Item_Code === itemPopupCode).slice().sort((a, b) => parseDT(b.Date_Time) - parseDT(a.Date_Time))
     : [];
 
-  if (!mounted || (loadingInvoices && invoices.length === 0)) {
+  if (!mounted || ((loadingInvoices || isRefreshing) && invoices.length === 0)) {
     return (
       <AppShell>
         <div className="space-y-5">
-          <h1 className="text-2xl font-bold tracking-tight text-primary">Invoices</h1>
-          <div className="py-20 text-center text-muted-foreground">
-            <RefreshCw className="h-6 w-6 animate-spin mx-auto mb-2" /> Loading invoices...
+          <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-3">
+            <div>
+              <h1 className="text-2xl font-bold tracking-tight text-primary">Invoices</h1>
+              <p className="text-muted-foreground text-sm mt-0.5">Every inward delivery recorded with an invoice number.</p>
+            </div>
           </div>
+          <Card className="border-none shadow-md">
+            <CardContent className="p-4 space-y-4">
+              <div className="space-y-2">
+                <Skeleton className="h-5 w-[250px]" />
+                <Skeleton className="h-4 w-[200px]" />
+              </div>
+              <div className="space-y-3">
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+              </div>
+            </CardContent>
+          </Card>
         </div>
       </AppShell>
     );
@@ -131,7 +166,15 @@ export default function InvoicesPage() {
       <div className="space-y-5">
         <div className="flex flex-col md:flex-row justify-between items-start md:items-center gap-3">
           <div>
-            <h1 className="text-2xl font-bold tracking-tight text-primary">Invoices</h1>
+            <div className="flex items-center gap-3">
+              <h1 className="text-2xl font-bold tracking-tight text-primary">Invoices</h1>
+              {isRefreshing && (
+                <div className="flex items-center gap-1.5 px-2 py-0.5 rounded bg-muted animate-pulse shrink-0">
+                  <Skeleton className="h-2 w-2 rounded-full bg-primary" />
+                  <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wider">Refreshing</span>
+                </div>
+              )}
+            </div>
             <p className="text-muted-foreground text-sm mt-0.5">Every inward delivery recorded with an invoice number.</p>
           </div>
           <div className="flex items-center border rounded-lg px-3 bg-white h-9">

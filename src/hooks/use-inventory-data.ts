@@ -2220,7 +2220,7 @@ export function useInvoices() {
   }, [toast]);
 
   return { invoices, addInvoice, deleteInvoice, loading, refresh: () => {
-    fullSync(true).catch(err => console.error("Sync failed on refresh:", err));
+    return fullSync(true);
   } };
 }
 
