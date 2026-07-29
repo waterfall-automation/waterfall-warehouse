@@ -63,6 +63,10 @@ export default function InvoicesPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  useEffect(() => {
+    console.log('Invoices refreshed:', invoices.length, invoices[0]);
+  }, [invoices]);
+
   const [search, setSearch] = useState('');
   const [activeInvoiceNo, setActiveInvoiceNo] = useState<string | null>(null);
   const [previewImageUrl, setPreviewImageUrl] = useState<string | null>(null);

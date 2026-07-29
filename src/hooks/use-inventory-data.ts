@@ -376,6 +376,7 @@ export function useInventoryEntries() {
       });
       if (!res.ok) throw new Error(`HTTP status ${res.status}`);
       const json = await res.json();
+      console.log('saveInwardBatch response:', json);
       if (!json || json.success === false) {
         throw new Error(json?.error || 'Failed to save batch');
       }
