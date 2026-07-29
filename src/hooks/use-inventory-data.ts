@@ -2149,7 +2149,7 @@ export function useInvoices() {
     const invoiceMap = new Map<string, Invoice>();
     data.forEach((i: any) => {
       if (i.Invoice_No && String(i.Invoice_No).trim() !== '') {
-        invoiceMap.set(i.Invoice_No.trim().toLowerCase(), i);
+        invoiceMap.set(String(i.Invoice_No || '').trim().toLowerCase(), i);
       }
     });
     return Array.from(invoiceMap.values()).filter((i: any) => i.Status !== 'Deleted');
