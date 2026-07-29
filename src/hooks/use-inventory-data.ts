@@ -2220,9 +2220,11 @@ export function useInvoices() {
     }
   }, [toast]);
 
-  return { invoices, addInvoice, deleteInvoice, loading, refresh: () => {
+  const refresh = useCallback(() => {
     return fullSync(true);
-  } };
+  }, []);
+
+  return { invoices, addInvoice, deleteInvoice, loading, refresh };
 }
 
 // 11. GST SUMMARY HOOK

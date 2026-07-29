@@ -221,9 +221,6 @@ function doGet(e) {
       case 'freshLaunchWipe':
         result = handleFreshLaunchWipe(e.parameter.confirm, ss);
         break;
-      case 'forceWipeDemoReset':
-        result = handleForceWipeDemoReset(e.parameter.confirm, ss);
-        break;
       case 'login':
         result = handleLogin(e.parameter.email, e.parameter.password, ss);
         break;
@@ -315,6 +312,9 @@ function doPost(e) {
         break;
       case 'saveInwardBatch':
         result = handleSaveInwardBatch(body, ss);
+        break;
+      case 'uploadInvoiceFile':
+        result = handleUploadInvoiceFile(body, ss);
         break;
       case 'saveEntry':
         result = handleSaveEntry(body, ss);

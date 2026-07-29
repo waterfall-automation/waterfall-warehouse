@@ -248,47 +248,8 @@ function handleCreateNotice(body, ss) {
     body.priority || 'info', caller.name || 'Admin',
     formatDateTime(), body.expiry || ''
   ]);
-
-  // Auto-create tasks for tagged users
-  if (body.taggedUsers && Array.isArray(body.taggedUsers)) {
-    var tasksSheet = ss.getSheetByName('Tasks');
-    if (tasksSheet) {
-      body.taggedUsers.forEach(function(userId) {
-        if (!userId) return;
-        var taskId = generateId('TSK');
-        // Headers: Task_ID, Assigned_To_User_ID, Text, Created_By, Notice_ID, Status, Created_On
-        tasksSheet.appendRow([
-          taskId,
-          userId,
-          body.content || body.title || '',
-          caller.name || 'Admin',
-          id,
-          'Pending',
-          formatDateTime()
-        ]);
-      });
-    }
-  }
-
   logActivity(ss, caller.id, caller.name, 'POST_NOTICE', body.title);
   return { success: true, noticeId: id };
-}
-
-function handleUpdateTaskStatus(body, ss) {
-  var caller = validateToken(body.token, ss);
-  if (!caller) return errResponse('UNAUTHORIZED');
-
-  var tasksSheet = ss.getSheetByName('Tasks');
-  if (!tasksSheet) return errResponse('Tasks sheet not found.');
-
-  var success = updateRowById(tasksSheet, 'Task_ID', body.taskId, {
-    'Status': body.status || 'Pending'
-  });
-
-  if (!success) return errResponse('Task not found.');
-
-  logActivity(ss, caller.id, caller.name, 'UPDATE_TASK_STATUS', body.taskId + ' -> ' + body.status);
-  return { success: true };
 }
 
 function handleDeleteNotice(body, ss) {

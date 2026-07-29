@@ -505,9 +505,9 @@ function handleSaveInwardBatch(body, ss) {
 
     // Save Invoice if applicable
     if (isWithInvoice) {
-      var invoicesSheet = getOrCreateSheet(ss, 'Invoices', ['Invoice_No', 'Vendor_Name', 'Date', 'Employee_Name', 'Total_Value', 'Created_On']);
+      var invoicesSheet = getOrCreateSheet(ss, 'Invoices', ['Invoice_No', 'Vendor_Name', 'Date', 'Employee_Name', 'Total_Value', 'Created_On', 'Invoice_File_URL']);
       invoicesSheet.appendRow([
-        invoiceNo, vendorName, invoiceDate, employeeName, body.invoice.totalValue.toFixed(2), formatDateTime()
+        invoiceNo, vendorName, invoiceDate, employeeName, body.invoice.totalValue.toFixed(2), formatDateTime(), ''
       ]);
     }
 
@@ -517,4 +517,91 @@ function handleSaveInwardBatch(body, ss) {
     lock.releaseLock();
     return errResponse('Transaction failed: ' + err.toString());
   }
+}
+
+function handleUploadInvoiceFile(body, ss) {
+  var caller = validateToken(body.token, ss);
+  if (!caller) return errResponse('UNAUTHORIZED');
+
+  var fileData = body.fileData;
+  var mimeType = body.mimeType;
+  var invoiceNo = body.invoiceNo;
+  var vendorName = body.vendorName;
+  var date = body.date;
+
+  if (!fileData) return errResponse('Missing file data.');
+  if (!invoiceNo) return errResponse('Missing invoice number.');
+
+  // Strip base64 metadata prefix if present
+  var base64Data = fileData;
+  if (base64Data.indexOf(';base64,') > -1) {
+    base64Data = base64Data.split(';base64,')[1];
+  }
+
+  var decoded;
+  try {
+    decoded = Utilities.base64Decode(base64Data);
+  } catch (e) {
+    return errResponse('Invalid base64 encoding: ' + e.toString());
+  }
+
+  var blob = Utilities.newBlob(decoded, mimeType);
+
+  var ext = 'bin';
+  if (mimeType === 'application/pdf') ext = 'pdf';
+  else if (mimeType === 'image/png') ext = 'png';
+  else if (mimeType === 'image/jpeg' || mimeType === 'image/jpg') ext = 'jpg';
+  else if (mimeType === 'image/svg+xml') ext = 'svg';
+  else if (mimeType === 'image/webp') ext = 'webp';
+  else {
+    var parts = mimeType.split('/');
+    if (parts.length > 1) ext = parts[1];
+  }
+
+  var baseName = invoiceNo + '_' + vendorName + '_' + date;
+  var cleanName = baseName.replace(/[\\\/\:\*\?\"\<\|\>]/g, '_');
+  var filename = cleanName + '.' + ext;
+  blob.setName(filename);
+
+  var folderName = 'SiccaSync Invoices';
+  var folders = DriveApp.getFoldersByName(folderName);
+  var folder;
+  if (folders.hasNext()) {
+    folder = folders.next();
+  } else {
+    folder = DriveApp.createFolder(folderName);
+  }
+
+  var file = folder.createFile(blob);
+  try {
+    file.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  } catch (e) {}
+
+  var fileUrl = file.getUrl();
+
+  var invoicesSheet = getOrCreateSheet(ss, 'Invoices', ['Invoice_No', 'Vendor_Name', 'Date', 'Employee_Name', 'Total_Value', 'Created_On', 'Invoice_File_URL']);
+  var lastRow = invoicesSheet.getLastRow();
+  if (lastRow > 1) {
+    var lastCol = invoicesSheet.getLastColumn();
+    var headers = invoicesSheet.getRange(1, 1, 1, lastCol).getValues()[0];
+    var fileUrlColIdx = headers.indexOf('Invoice_File_URL');
+    if (fileUrlColIdx === -1) {
+      fileUrlColIdx = headers.length;
+      invoicesSheet.getRange(1, fileUrlColIdx + 1).setValue('Invoice_File_URL');
+    }
+    
+    var invNoColIdx = headers.indexOf('Invoice_No');
+    if (invNoColIdx !== -1) {
+      var range = invoicesSheet.getRange(2, 1, lastRow - 1, lastCol);
+      var values = range.getValues();
+      for (var r = 0; r < values.length; r++) {
+        if (String(values[r][invNoColIdx]).trim() === String(invoiceNo).trim()) {
+          invoicesSheet.getRange(r + 2, fileUrlColIdx + 1).setValue(fileUrl);
+          break;
+        }
+      }
+    }
+  }
+
+  return okResponse({ fileUrl: fileUrl });
 }

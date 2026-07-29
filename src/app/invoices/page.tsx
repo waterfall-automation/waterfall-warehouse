@@ -62,12 +62,7 @@ export default function InvoicesPage() {
     return () => {
       active = false;
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  useEffect(() => {
-    console.log('Invoices refreshed:', invoices.length, invoices[0]);
-  }, [invoices]);
+  }, [refreshInvoices]);
 
   const { toast } = useToast();
   const [search, setSearch] = useState('');
