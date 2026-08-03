@@ -436,14 +436,10 @@ export default function InvoicesPage() {
                     <Button 
                       variant="secondary"
                       size="sm"
-                      onClick={() => {
-                        setAttachingInvoice(activeInvoice);
-                        setAttachmentFile(null);
-                        setAttachModalOpen(true);
-                      }}
-                      className="w-full bg-white/20 hover:bg-white/30 text-white text-xs font-semibold h-8 rounded-lg flex items-center justify-center gap-1.5 border border-white/10"
+                      disabled
+                      className="w-full bg-white/10 text-white/50 text-xs font-semibold h-8 rounded-lg flex items-center justify-center gap-1.5 border border-white/5 cursor-not-allowed opacity-50"
                     >
-                      <Upload className="h-3.5 w-3.5" /> Attach Photo
+                      <Upload className="h-3.5 w-3.5" /> Photo upload — coming soon
                     </Button>
                   )}
                 </div>
