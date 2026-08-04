@@ -168,27 +168,34 @@ function LocationPicker({ rowQty, value, onChange }: {
 
   const addAllocation = () => {
     const qn = parseFloat(qty || '0');
-    if (!cupboardId || !boxId || qn <= 0) return;
+    if (!cupboardId || qn <= 0) return;
     const cup = cupboards.find(c => c.Cupboard_ID === cupboardId);
-    const box = boxes.find(b => b.Box_ID === boxId);
-    if (!cup || !box) return;
+    const box = boxId ? boxes.find(b => b.Box_ID === boxId) : null;
+    if (!cup || (boxId && !box)) return;
     onChange([...value, {
       key: Math.random().toString(36).slice(2),
       cupboardId: cup.Cupboard_ID, cupboardName: cup.Name,
-      boxId: box.Box_ID, boxName: box.Box_Name, qty: String(qn),
+      boxId: box ? box.Box_ID : '', boxName: box ? box.Box_Name : 'Direct', qty: String(qn),
     }]);
     resetMiniForm();
   };
 
   const removeAllocation = (key: string) => onChange(value.filter(l => l.key !== key));
 
+  const isFullyPlaced = rowQty > 0 && remaining <= 0;
+  const isPartiallyPlaced = allocated > 0 && remaining > 0;
+
+  const locationsLabel = value.map(loc => 
+    `${loc.cupboardName}${loc.boxName && loc.boxName !== 'Direct' ? '/' + loc.boxName : ''} (${loc.qty})`
+  ).join(', ');
+
   return (
     <div>
-      {value.length > 0 && (
+      {isPartiallyPlaced && (
         <div className="flex flex-wrap gap-1 mb-1.5">
           {value.map(loc => (
             <span key={loc.key} className="inline-flex items-center gap-1 text-xs bg-blue-50 border border-blue-200 text-blue-700 rounded-full pl-2 pr-1 py-0.5">
-              {loc.cupboardName}/{loc.boxName}: {loc.qty}
+              {loc.cupboardName}{loc.boxName && loc.boxName !== 'Direct' ? `/${loc.boxName}` : ''}: {loc.qty}
               <button type="button" onClick={() => removeAllocation(loc.key)} className="hover:text-red-600"><X className="h-3 w-3" /></button>
             </span>
           ))}
@@ -196,9 +203,26 @@ function LocationPicker({ rowQty, value, onChange }: {
       )}
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
-          <button type="button" className="flex items-center gap-1 text-xs px-2 py-1.5 rounded-md border bg-gray-50 border-gray-200 text-gray-600 hover:bg-gray-100 w-full justify-center">
-            <MapPin className="h-3 w-3" /> {value.length > 0 ? 'Add another' : 'Set location'}
-          </button>
+          {isFullyPlaced ? (
+            <button 
+              type="button" 
+              className="flex items-center gap-1 text-xs px-2 py-1.5 rounded-md border bg-indigo-50 border-indigo-200 text-indigo-700 hover:bg-indigo-100 w-full justify-between"
+            >
+              <span className="flex items-center gap-1 truncate font-medium">
+                <MapPin className="h-3 w-3 text-indigo-500 shrink-0" />
+                <span className="truncate">{locationsLabel}</span>
+              </span>
+              <span className="text-[10px] font-bold text-indigo-500 hover:underline shrink-0 ml-1">Edit</span>
+            </button>
+          ) : (
+            <button 
+              type="button" 
+              className="flex items-center gap-1 text-xs px-2 py-1.5 rounded-md border bg-gray-50 border-gray-200 text-gray-600 hover:bg-gray-100 w-full justify-center"
+            >
+              <MapPin className="h-3 w-3" /> 
+              {isPartiallyPlaced ? `Set location (${remaining} left)` : 'Set location'}
+            </button>
+          )}
         </PopoverTrigger>
         <PopoverContent className="w-80 max-w-[calc(100vw-32px)] space-y-3" align="start">
           {rowQty > 0 && (
@@ -534,6 +558,7 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
 
   const handleSubmit = async (bypassDuplicateCheck = false) => {
     try {
+      console.log('handleSubmit started');
       setError('');
       const errs: Record<string, string> = {};
       if (!String(employeeName || '').trim()) errs.employeeName = 'Employee name is required.';
@@ -616,6 +641,7 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
       }))
     };
 
+    console.log('About to call saveInwardBatch', payload);
     const res = await saveInwardBatch(payload);
 
     if (res.success) {
