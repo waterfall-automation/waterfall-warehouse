@@ -237,7 +237,7 @@ function LocationPicker({ rowQty, value, onChange }: {
             />
           </div>
 
-          {boxId && (
+          {(cupboardId || boxId) && (
             <div>
               <label className="text-xs font-semibold text-gray-700">Quantity to place here</label>
               <Input 
@@ -260,7 +260,7 @@ function LocationPicker({ rowQty, value, onChange }: {
             type="button" 
             size="sm" 
             className="w-full" 
-            disabled={!cupboardId || !boxId || !qty || parseFloat(qty) <= 0 || parseFloat(qty) > remaining} 
+            disabled={!(cupboardId || boxId) || !qty || parseFloat(qty) <= 0 || parseFloat(qty) > remaining} 
             onClick={addAllocation}
           >
             Add Location
@@ -533,40 +533,46 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
   };
 
   const handleSubmit = async (bypassDuplicateCheck = false) => {
-    setError('');
-    const errs: Record<string, string> = {};
-    if (!employeeName.trim()) errs.employeeName = 'Employee name is required.';
-    if (mode === 'with') {
-      if (!invoiceNo.trim()) errs.invoiceNo = 'Invoice No is required.';
-      if (!vendorName.trim()) errs.vendorName = 'Vendor Name is required.';
-    }
-    
-    // Check rows for empty itemName/qty
-    rows.forEach((r) => {
-      if (!r.itemName.trim()) errs[`itemName_${r.key}`] = 'Item Name is required.';
-      if (!r.qty || parseFloat(r.qty) <= 0) errs[`qty_${r.key}`] = 'Quantity is required.';
-    });
+    try {
+      setError('');
+      const errs: Record<string, string> = {};
+      if (!String(employeeName || '').trim()) errs.employeeName = 'Employee name is required.';
+      if (mode === 'with') {
+        if (!String(invoiceNo || '').trim()) errs.invoiceNo = 'Invoice No is required.';
+        if (!String(vendorName || '').trim()) errs.vendorName = 'Vendor Name is required.';
+      }
+      
+      // Check rows for empty itemName/qty
+      rows.forEach((r) => {
+        if (!String(r.itemName || '').trim()) errs[`itemName_${r.key}`] = 'Item Name is required.';
+        if (!r.qty || parseFloat(r.qty) <= 0) errs[`qty_${r.key}`] = 'Quantity is required.';
+      });
 
-    if (Object.keys(errs).length > 0) {
-      setErrors(errs);
-      setError('Please correct the highlighted fields before saving.');
-      return;
-    }
-
-    if (rows.some(r => {
-      const allocated = r.locations.reduce((s, l) => s + parseFloat(l.qty || '0'), 0);
-      return allocated > parseFloat(r.qty || '0');
-    })) { setError('A row has more quantity placed across locations than it received.'); return; }
-
-    if (mode === 'with' && !bypassDuplicateCheck) {
-      const existing = invoices.find(inv => 
-        inv.Invoice_No.trim().toLowerCase() === invoiceNo.trim().toLowerCase() &&
-        inv.Vendor_Name.trim().toLowerCase() === vendorName.trim().toLowerCase()
-      );
-      if (existing) {
-        setDupInvoiceData(existing);
+      if (Object.keys(errs).length > 0) {
+        setErrors(errs);
+        setError('Please correct the highlighted fields before saving.');
         return;
       }
+
+      if (rows.some(r => {
+        const allocated = r.locations.reduce((s, l) => s + parseFloat(l.qty || '0'), 0);
+        return allocated > parseFloat(r.qty || '0');
+      })) { setError('A row has more quantity placed across locations than it received.'); return; }
+
+      if (mode === 'with' && !bypassDuplicateCheck) {
+        const existing = invoices.find(inv => 
+          String(inv.Invoice_No || '').trim().toLowerCase() === String(invoiceNo || '').trim().toLowerCase() &&
+          String(inv.Vendor_Name || '').trim().toLowerCase() === String(vendorName || '').trim().toLowerCase()
+        );
+        if (existing) {
+          setDupInvoiceData(existing);
+          return;
+        }
+      }
+    } catch (err: any) {
+      console.error('Validation failed:', err);
+      setError('An unexpected validation error occurred: ' + err.message);
+      return;
     }
 
     setSaving(true);
@@ -578,13 +584,13 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
     });
 
     const payload = {
-      employeeName: employeeName.trim(),
+      employeeName: String(employeeName || '').trim(),
       isNewEmployee,
       dateTime,
       grnNo: mode === 'with' ? grnNo : '',
       invoice: mode === 'with' ? {
-        invoiceNo: invoiceNo.trim(),
-        vendorName: vendorName.trim(),
+        invoiceNo: String(invoiceNo || '').trim(),
+        vendorName: String(vendorName || '').trim(),
         date: toDisplayDateTime(entryDate).split(' ')[0],
         totalValue
       } : null,
@@ -624,8 +630,8 @@ export function InwardModal({ onClose }: { onClose: () => void }) {
                 action: 'uploadInvoiceFile',
                 fileData: scannedFile.base64Data,
                 mimeType: scannedFile.mimeType,
-                invoiceNo: invoiceNo.trim(),
-                vendorName: vendorName.trim(),
+                invoiceNo: String(invoiceNo || '').trim(),
+                vendorName: String(vendorName || '').trim(),
                 date: toDisplayDateTime(entryDate).split(' ')[0],
                 token: localStorage.getItem('sicca_token') || ''
               })
