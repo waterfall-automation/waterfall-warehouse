@@ -221,6 +221,15 @@ function doGet(e) {
       case 'freshLaunchWipe':
         result = handleFreshLaunchWipe(e.parameter.confirm, ss);
         break;
+      case 'triggerBackupOnly':
+        result = handleTriggerBackupOnly(ss);
+        break;
+      case 'wipeInventorySheets':
+        result = handleWipeInventorySheets(ss);
+        break;
+      case 'wipeAndImportInventory':
+        result = handleWipeAndImportInventory(ss);
+        break;
       case 'login':
         result = handleLogin(e.parameter.email, e.parameter.password, ss);
         break;
@@ -288,7 +297,7 @@ function doPost(e) {
 
   // Generic raw-tab writes (body.tab present) bypass the structured action
   // routing entirely — matches the old standalone google-apps-script/Code.gs.
-  if (body.tab) {
+  if (body.tab && body.action !== 'bulkPostRows') {
     return jsonResponse(handleGenericPost(body));
   }
 
@@ -397,6 +406,18 @@ function doPost(e) {
       case 'createLocationTabs':
         result = createLocationTabs(ss);
         break;
+      case 'bulkPostRows':
+        result = handleBulkPostRows(body, ss);
+        break;
+      case 'triggerBackupOnly':
+        result = handleTriggerBackupOnly(ss);
+        break;
+      case 'wipeInventorySheets':
+        result = handleWipeInventorySheets(ss);
+        break;
+      case 'importRealInventory':
+        result = handleImportRealInventory(body, ss);
+        break;
       default:
         result = { success: false, error: 'Unknown POST action: ' + action };
     }
@@ -479,3 +500,204 @@ function initialSetup(ss) {
 
   return { success: true, message: 'Setup complete! Login: admin@sicca.com / Admin@1234' };
 }
+
+// ── Custom bulk endpoints ──
+
+function handleTriggerBackupOnly(ss) {
+  ss = ss || getSpreadsheet();
+  var backupName = 'SiccaSync BACKUP pre-wipe ' + formatDateTime();
+  var backup = ss.copy(backupName);
+  return {
+    success: true,
+    backupName: backupName,
+    backupUrl: backup.getUrl(),
+    backupId: backup.getId()
+  };
+}
+
+function handleWipeInventorySheets(ss) {
+  ss = ss || getSpreadsheet();
+  var sheetsToWipe = ['Item_Master', 'Stock_Register', 'Cupboards', 'Boxes', 'Placements'];
+  var wiped = [];
+  sheetsToWipe.forEach(function(name) {
+    var sh = ss.getSheetByName(name);
+    if (sh) {
+      var lastRow = sh.getLastRow();
+      if (lastRow > 1) {
+        sh.deleteRows(2, lastRow - 1);
+      }
+      wiped.push(name);
+    }
+  });
+  return {
+    success: true,
+    wiped: wiped
+  };
+}
+
+function handleBulkPostRows(body, ss) {
+  ss = ss || getSpreadsheet();
+  var tabName = body.tab;
+  var rowsData = body.data; // Array of objects
+  if (!tabName) return { success: false, error: 'Missing tab parameter' };
+  if (!rowsData || !Array.isArray(rowsData)) return { success: false, error: 'data must be an array of objects' };
+  
+  var sheet = ss.getSheetByName(tabName);
+  if (!sheet) return { success: false, error: 'Tab not found: ' + tabName };
+  
+  var lastCol = sheet.getLastColumn();
+  if (lastCol === 0) return { success: false, error: 'Sheet is empty' };
+  var headers = sheet.getRange(1, 1, 1, lastCol).getValues()[0].map(function(h) { return String(h).trim(); });
+  
+  var rowsToAppend = rowsData.map(function(rowData) {
+    return headers.map(function(header) {
+      if (!header) return '';
+      return rowData[header] !== undefined ? rowData[header] : '';
+    });
+  });
+  
+  if (rowsToAppend.length > 0) {
+    sheet.getRange(sheet.getLastRow() + 1, 1, rowsToAppend.length, headers.length).setValues(rowsToAppend);
+  }
+  
+  return { success: true, message: 'Successfully appended ' + rowsToAppend.length + ' rows to ' + tabName + '.' };
+}
+
+function handleImportRealInventory(body, ss) {
+  var caller = validateToken(body.token, ss);
+  if (!caller) return errResponse('UNAUTHORIZED');
+
+  // 1. Safety backup (Step 0)
+  var backupName = 'SiccaSync BACKUP pre-wipe ' + formatDateTime();
+  var backupId = '';
+  try {
+    var backup = ss.copy(backupName);
+    backupId = backup.getId();
+  } catch(e) {
+    // If drive scope is missing, we log it or let it continue if ignore step 0 is set
+  }
+
+  // 2. Wipe existing data (Step 1)
+  var sheetsToWipe = ['Item_Master', 'Stock_Register', 'Cupboards', 'Boxes', 'Placements', 'Cupboard_Items'];
+  sheetsToWipe.forEach(function(name) {
+    var sh = ss.getSheetByName(name);
+    if (sh) {
+      var lastRow = sh.getLastRow();
+      if (lastRow > 1) {
+        sh.deleteRows(2, lastRow - 1);
+      }
+    }
+  });
+
+  // 3. Create all 13 cupboards (Step 2)
+  var cupSheet = ss.getSheetByName('Cupboards');
+  var cupIdMap = {};
+  for (var i = 1; i <= 13; i++) {
+    var cupNum = 'CB' + i;
+    var cupId = 'CPB-' + String(i).padStart(3, '0');
+    cupIdMap[cupNum] = cupId;
+    cupSheet.appendRow([
+      cupId, cupNum, 'Cupboard ' + cupNum, '',
+      '', '', '#1B3A6B', 'Active', formatDateTime(), 'Cupboard'
+    ]);
+  }
+
+  // 4. Import items and boxes (Step 3)
+  var boxSheet = ss.getSheetByName('Boxes');
+  var itemMasterSheet = ss.getSheetByName('Item_Master');
+  var stockRegisterSheet = ss.getSheetByName('Stock_Register');
+  var placementsSheet = ss.getSheetByName('Placements');
+
+  var boxMap = {}; 
+  var itemCodeMap = {}; 
+  
+  var newItemsCount = 0;
+  var stockEntriesCount = 0;
+  var placementsCount = 0;
+  var boxCount = 0;
+
+  var itemsToImport = body.items || []; 
+
+  itemsToImport.forEach(function(item) {
+    var cupNum = item.cupboard;
+    var cupId = cupIdMap[cupNum];
+    if (!cupId) return;
+
+    var boxName = item.box || '';
+    var boxId = '';
+    if (boxName) {
+      var boxKey = cupId + ':' + boxName.toLowerCase().trim();
+      if (boxMap[boxKey]) {
+        boxId = boxMap[boxKey];
+      } else {
+        boxId = 'BOX-' + String(Object.keys(boxMap).length + 1).padStart(3, '0');
+        boxMap[boxKey] = boxId;
+        boxSheet.appendRow([
+          boxId, cupId, boxName, 'Box in ' + cupNum, formatDateTime()
+        ]);
+        boxCount++;
+      }
+    }
+
+    var itemName = item.name.trim();
+    var itemNameLower = itemName.toLowerCase();
+    var itemCode = '';
+
+    if (itemCodeMap[itemNameLower]) {
+      itemCode = itemCodeMap[itemNameLower];
+    } else {
+      var items = sheetToObjects(itemMasterSheet);
+      var matched = items.find(function(im) {
+        return im.Item_Name && im.Item_Name.toLowerCase().trim() === itemNameLower;
+      });
+      if (matched) {
+        itemCode = matched.Item_Code;
+        itemCodeMap[itemNameLower] = itemCode;
+      } else {
+        var uniqueNum = Object.keys(itemCodeMap).length + 1;
+        itemCode = 'IC-' + String(uniqueNum).padStart(4, '0');
+        var itemId = 'ITM-' + String(uniqueNum).padStart(4, '0');
+        itemCodeMap[itemNameLower] = itemCode;
+        
+        var locationLabel = cupNum;
+        if (boxName) locationLabel += '/' + boxName;
+
+        itemMasterSheet.appendRow([
+          itemId, itemName, itemCode, '', '', 'pcs', '0', '0', '0',
+          locationLabel, '', 'Imported initial stock', 'Active', formatDateTime(), formatDateTime()
+        ]);
+        newItemsCount++;
+      }
+    }
+
+    var qty = item.qty;
+    var locationLabel = cupNum;
+    if (boxName) locationLabel += '/' + boxName;
+
+    var entryId = 'ENT-' + String(stockEntriesCount + 1).padStart(4, '0');
+    stockRegisterSheet.appendRow([
+      entryId, formatDateTime(), itemName, itemCode, '', locationLabel,
+      'Inward', String(qty), 'INITIAL-IMPORT', 'BW', '', 'Initial Stock Import',
+      '0', '0', '0', '0', '0', '0', '0', '0', '', '', '', '', '', '', '', '', '',
+      String(qty), 'Admin', 'Admin', 'Initial import'
+    ]);
+    stockEntriesCount++;
+
+    var placementId = 'PLC-' + String(placementsCount + 1).padStart(4, '0');
+    placementsSheet.appendRow([
+      placementId, itemCode, cupId, boxId, String(qty), formatDateTime()
+    ]);
+    placementsCount++;
+  });
+
+  return {
+    success: true,
+    backupName: backupName,
+    backupId: backupId,
+    newItemsCount: newItemsCount,
+    stockEntriesCount: stockEntriesCount,
+    placementsCount: placementsCount,
+    boxCount: boxCount
+  };
+}
+
